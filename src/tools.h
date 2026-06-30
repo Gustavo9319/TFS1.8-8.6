@@ -8,7 +8,16 @@
 #include "enums.h"
 #include "position.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <ctime>
+#include <random>
+#include <string>
+#include <string_view>
+#include <type_traits>
 #include <utility>
+#include <vector>
 
 void printXMLError(std::string_view where, std::string_view fileName, const pugi::xml_parse_result& result);
 

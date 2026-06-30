@@ -8,7 +8,9 @@
 #include "tools.h"
 
 #include <array>
+#include <cmath>
 #include <cstdint>
+#include <memory>
 #include <unordered_map>
 
 struct CombatDamage;

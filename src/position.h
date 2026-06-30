@@ -4,6 +4,11 @@
 #ifndef FS_POSITION_H
 #define FS_POSITION_H
 
+#include <concepts>
+#include <cstdint>
+#include <ostream>
+#include <tuple>
+
 enum Direction : uint8_t
 {
 	DIRECTION_NORTH = 0,
