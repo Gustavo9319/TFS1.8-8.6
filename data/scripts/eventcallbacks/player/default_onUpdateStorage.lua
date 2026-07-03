@@ -2,8 +2,17 @@ local lastQuestUpdate = {}
 
 local event = Event()
 
-event.onUpdateStorage = function(player, key, value, oldValue, isLogin)
-	if isLogin then return end
+event.onUpdateStorage = function(creature, key, value, oldValue, isSpawn)
+	if isSpawn then return end
+
+	local player = creature:getPlayer()
+	if not player then
+		player = Player(creature:getId())
+	end
+
+	if not player then
+		return
+	end
 
 	local playerId = player:getId()
 	local now = os.mtime()
@@ -13,7 +22,7 @@ event.onUpdateStorage = function(player, key, value, oldValue, isLogin)
 		Game.isQuestStorage(key, value, oldValue) then
 		lastQuestUpdate[playerId] = os.mtime() + 100
 		player:sendTextMessage(MESSAGE_EVENT_ADVANCE,
-		                       "Your questlog has been updated.")
+		                       "Your questlog has been updated.\nView your questlog for more information.")
 	end
 end
 

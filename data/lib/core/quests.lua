@@ -118,15 +118,29 @@ function Game.createQuest(name, quest)
 end
 
 function Game.isQuestStorage(key, value, oldValue)
+	key = tonumber(key)
+	value = tonumber(value)
+	oldValue = tonumber(oldValue) or -1
+
+	if not key or not value then
+		return false
+	end
+
 	for _, quest in pairs(quests) do
-		if quest.storageId == key and quest.storageValue == value then return true end
+		local questStorageId = tonumber(quest.storageId)
+		local questStorageValue = tonumber(quest.storageValue)
+
+		if questStorageId == key and questStorageValue == value and oldValue ~= value then return true end
 	end
 
 	for _, mission in pairs(missions) do
-		if mission.storageId == key and value >= mission.startValue and value <=
-			mission.endValue then
-			return not mission.description or oldValue < mission.startValue or oldValue >
-				       mission.endValue
+		local storageId = tonumber(mission.storageId)
+		local startValue = tonumber(mission.startValue)
+		local endValue = tonumber(mission.endValue)
+
+		if storageId == key and startValue and endValue and value >= startValue and value <=
+			endValue then
+			return oldValue ~= value
 		end
 	end
 	return false
