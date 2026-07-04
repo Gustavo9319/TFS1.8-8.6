@@ -190,6 +190,23 @@ const std::unordered_map<std::string, ItemParseAttributes_t> ItemParseAttributes
     {"magiclevelphysical", ITEM_PARSE_MAGICLEVELPHYSICAL},
     {"magiclevelhealing", ITEM_PARSE_MAGICLEVELHEALING},
     {"magiclevelundefined", ITEM_PARSE_MAGICLEVELUNDEFINED},
+    // Alternate "<element>magiclevelpoints" spellings: each is an alias of the matching magiclevel*
+    // key above and is handled by the same ITEM_PARSE_MAGICLEVEL* case. Kept 1:1 with the family
+    // above so every magic-level type is reachable under both spellings.
+    {"energymagiclevelpoints", ITEM_PARSE_MAGICLEVELENERGY},
+    {"firemagiclevelpoints", ITEM_PARSE_MAGICLEVELFIRE},
+    {"earthmagiclevelpoints", ITEM_PARSE_MAGICLEVELPOISON},
+    {"icemagiclevelpoints", ITEM_PARSE_MAGICLEVELICE},
+    {"holymagiclevelpoints", ITEM_PARSE_MAGICLEVELHOLY},
+    {"deathmagiclevelpoints", ITEM_PARSE_MAGICLEVELDEATH},
+    {"lifedrainmagiclevelpoints", ITEM_PARSE_MAGICLEVELLIFEDRAIN},
+    {"manadrainmagiclevelpoints", ITEM_PARSE_MAGICLEVELMANADRAIN},
+    {"drownmagiclevelpoints", ITEM_PARSE_MAGICLEVELDROWN},
+    {"physicalmagiclevelpoints", ITEM_PARSE_MAGICLEVELPHYSICAL},
+    {"healingmagiclevelpoints", ITEM_PARSE_MAGICLEVELHEALING},
+    {"undefinedmagiclevelpoints", ITEM_PARSE_MAGICLEVELUNDEFINED},
+    {"perfectshotdamage", ITEM_PARSE_PERFECTSHOTDAMAGE},
+    {"perfectshotrange", ITEM_PARSE_PERFECTSHOTRANGE},
     {"suppressdrunk", ITEM_PARSE_SUPPRESSDRUNK},
     {"suppressenergy", ITEM_PARSE_SUPPRESSENERGY},
     {"suppressfire", ITEM_PARSE_SUPPRESSFIRE},
@@ -1786,6 +1803,17 @@ void Items::parseItemNode(const pugi::xml_node& itemNode, uint16_t id)
 				case ITEM_PARSE_MAGICLEVELUNDEFINED: {
 					abilities.specialMagicLevelSkill[combatTypeToIndex(COMBAT_UNDEFINEDDAMAGE)] +=
 					    pugi::cast<int16_t>(valueAttribute.value());
+					break;
+				}
+
+				case ITEM_PARSE_PERFECTSHOTDAMAGE: {
+					abilities.perfectShotDamage = pugi::cast<int32_t>(valueAttribute.value());
+					break;
+				}
+
+				case ITEM_PARSE_PERFECTSHOTRANGE: {
+					abilities.perfectShotRange =
+					    static_cast<uint8_t>(std::clamp<int32_t>(pugi::cast<int32_t>(valueAttribute.value()), 0, 255));
 					break;
 				}
 

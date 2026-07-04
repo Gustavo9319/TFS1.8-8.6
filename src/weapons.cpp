@@ -18,6 +18,75 @@
 extern Game g_game;
 extern Vocations g_vocations;
 
+namespace {
+
+int32_t getPerfectShotDamageForRange(const Item* item, int32_t range)
+{
+	if (!item || range == 0 || item->getPerfectShotRange() != range) {
+		return 0;
+	}
+
+	return item->getPerfectShotDamage();
+}
+
+int32_t getPerfectShotDamage(const Player* player, const Item* attackingItem, const Creature* target)
+{
+	if (!player || !target || player->getPosition().z != target->getPosition().z) {
+		return 0;
+	}
+
+	const Position& playerPos = player->getPosition();
+	const Position& targetPos = target->getPosition();
+	// Tibia uses Chebyshev distance for ranged attacks, so the perfect shot only triggers when the
+	// greater of the two axis distances matches the configured range exactly.
+	const int32_t distance = std::max(playerPos.getDistanceX(targetPos), playerPos.getDistanceY(targetPos));
+
+	int32_t perfectShotDamage = getPerfectShotDamageForRange(attackingItem, distance);
+
+	// Mirror the other per-item combat bonuses (absorb/reflect/boost): walk the equipped slots in
+	// place, skipping slots whose item abilities are disabled, instead of allocating a vector per shot.
+	for (int32_t slot = CONST_SLOT_FIRST; slot <= CONST_SLOT_AMMO; ++slot) {
+		if (!player->isItemAbilityEnabled(static_cast<slots_t>(slot))) {
+			continue;
+		}
+
+		const Item* equippedItem = player->getInventoryItem(static_cast<slots_t>(slot));
+		if (!equippedItem || equippedItem == attackingItem) {
+			continue;
+		}
+
+		perfectShotDamage += getPerfectShotDamageForRange(equippedItem, distance);
+	}
+
+	return perfectShotDamage;
+}
+
+// Folds the perfect shot bonus into damage and returns the signed delta it applied (0 if none), so
+// callers that route damage elsewhere (e.g. the chain system) can re-deliver the same bonus.
+int32_t applyPerfectShotDamage(const Player* player, const Item* item, const Creature* target, CombatDamage& damage)
+{
+	if (damage.origin != ORIGIN_RANGED && damage.origin != ORIGIN_WAND) {
+		return 0;
+	}
+
+	const int32_t perfectShotDamage = getPerfectShotDamage(player, item, target);
+	if (perfectShotDamage <= 0) {
+		return 0;
+	}
+
+	int32_t delta = 0;
+	if (damage.primary.value < 0) {
+		delta = -perfectShotDamage;
+	} else if (damage.primary.value > 0) {
+		delta = perfectShotDamage;
+	}
+
+	damage.primary.value += delta;
+	return delta;
+}
+
+} // namespace
+
 Weapons::Weapons() { scriptInterface.initState(); }
 
 Weapons::~Weapons() { clear(false); }
@@ -365,6 +434,7 @@ void Weapon::internalUseWeapon(Player* player, Item* item, Creature* target, int
 		damage.primary.value = (getWeaponDamage(player, target, item) * damageModifier) / 100;
 		damage.secondary.type = getElementType();
 		damage.secondary.value = (getElementDamage(player, target, item) * damageModifier) / 100;
+		const int32_t perfectShotDelta = applyPerfectShotDamage(player, item, target, damage);
 
 		CombatDamage cleaveSnapshot = damage;
 		uint32_t targetId = target->getID();
@@ -374,6 +444,22 @@ void Weapon::internalUseWeapon(Player* player, Item* item, Creature* target, int
 			chainCombat->setupChain(g_weapons->getWeapon(item));
 			if (!chainCombat->doCombatChain(player, target, params.aggressive)) {
 				Combat::doTargetCombat(player, target, damage, params);
+			} else if (perfectShotDelta != 0) {
+				// doCombatChain recomputes damage per target and ignores our boosted `damage`, so the
+				// primary target would otherwise lose the perfect shot bonus. Deliver just the bonus to
+				// it as an extra flat hit, re-resolving by id since the chain may have freed the target.
+				if (Creature* primaryTarget = g_game.getCreatureByID(targetId)) {
+					CombatDamage perfectShotHit;
+					perfectShotHit.origin = damage.origin;
+					perfectShotHit.primary.type = damage.primary.type;
+					perfectShotHit.primary.value = perfectShotDelta;
+
+					CombatParams perfectShotParams;
+					perfectShotParams.combatType = damage.primary.type;
+					perfectShotParams.origin = damage.origin;
+					perfectShotParams.aggressive = params.aggressive;
+					Combat::doTargetCombat(player, primaryTarget, perfectShotHit, perfectShotParams);
+				}
 			}
 		} else {
 			Combat::doTargetCombat(player, target, damage, params);

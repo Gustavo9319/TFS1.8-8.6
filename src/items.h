@@ -153,6 +153,8 @@ enum ItemParseAttributes_t
 	ITEM_PARSE_MAGICLEVELPHYSICAL,
 	ITEM_PARSE_MAGICLEVELHEALING,
 	ITEM_PARSE_MAGICLEVELUNDEFINED,
+	ITEM_PARSE_PERFECTSHOTDAMAGE,
+	ITEM_PARSE_PERFECTSHOTRANGE,
 	ITEM_PARSE_SUPPRESSDRUNK,
 	ITEM_PARSE_SUPPRESSENERGY,
 	ITEM_PARSE_SUPPRESSFIRE,
@@ -303,6 +305,10 @@ struct Abilities
 	std::array<int16_t, COMBAT_COUNT> absorbPercent = {0};
 
 	std::array<Reflect, COMBAT_COUNT> reflect;
+
+	// perfect shot
+	int32_t perfectShotDamage = 0;
+	uint8_t perfectShotRange = 0;
 
 	// experience rates
 	std::array<int32_t, static_cast<size_t>(ExperienceRateType::STAMINA) + 1> experienceRate = {0};
