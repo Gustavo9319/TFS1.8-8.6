@@ -16,7 +16,7 @@
 ![C++](https://img.shields.io/badge/C++-23-00599C?style=for-the-badge&logo=cplusplus&logoColor=white)
 ![Lua](https://img.shields.io/badge/Lua-5.5-2C2D72?style=for-the-badge&logo=lua&logoColor=white)
 ![MariaDB](https://img.shields.io/badge/MariaDB-003545?style=for-the-badge&logo=mariadb&logoColor=white)
-![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%2B-E95420?style=for-the-badge&logo=ubuntu&logoColor=white)
+![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%20%7C%2024.04-E95420?style=for-the-badge&logo=ubuntu&logoColor=white)
 ![Windows](https://img.shields.io/badge/Windows-vcpkg-0078D4?style=for-the-badge&logo=windows&logoColor=white)
 
 <br />
@@ -357,7 +357,11 @@ chmod +x build.sh
 ./build.sh
 ```
 
-The script detects your Ubuntu version, lets you choose the language, installs missing dependencies, prepares Lua 5.5, `simdutf`, `mio` and builds the server in Release mode.
+The script supports Ubuntu 22.04 and Ubuntu 24.04. It detects your Ubuntu version, lets you choose the language, installs missing dependencies, prepares Lua 5.5, `simdutf`, `mio` and builds the server in Release mode.
+
+Ubuntu 22.04 uses `gcc-12`/`g++-12` automatically because the default `g++` 11 package does not provide the C++23 `std::move_only_function` support required by this source. Ubuntu 24.04 can use the default compiler packages.
+
+If Ubuntu 22.04 fails with `TaskReactor requires C++23 std::move_only_function support` or `ThreadPool requires C++23 std::move_only_function support`, rerun the automatic script without `--skip-deps` so it can install `g++-12`, then rebuild with `--clean`.
 
 Useful examples:
 
@@ -379,8 +383,9 @@ Manual compilation notes are kept below only for advanced/custom setups.
 
 Manual build requirements:
 
+- Only Ubuntu 22.04 and Ubuntu 24.04 are supported by the automatic script.
 - Ubuntu 24.04 is recommended.
-- Ubuntu 22.04 and Ubuntu 24.04 are supported.
+- Ubuntu 22.04 requires `gcc-12` and `g++-12` for C++23 support.
 - Lua 5.5 is installed manually because Ubuntu does not ship it as a normal apt package.
 - `simdutf` and `mio` are installed manually into `$HOME/.local`.
 
@@ -389,11 +394,13 @@ Install system dependencies:
 ```bash
 sudo apt update
 sudo apt install -y \
-  git wget cmake build-essential pkg-config \
+  git wget cmake build-essential pkg-config gcc-12 g++-12 \
   libmysqlclient-dev \
   libpugixml-dev libfmt-dev libssl-dev libspdlog-dev libmimalloc-dev \
   libabsl-dev libasio-dev zlib1g-dev
 ```
+
+On Ubuntu 24.04, `gcc-12` and `g++-12` are not required when using the default compiler.
 
 Install Lua 5.5:
 
@@ -412,11 +419,14 @@ lua -v
 The build command below passes Lua explicitly. Keep these CMake flags when building manually:
 
 ```bash
+-DCMAKE_CXX_COMPILER=/usr/bin/g++-12 \
 -DLUA_INCLUDE_DIR=/usr/local/include \
 -DLUA_LIBRARY=/usr/local/lib/liblua.a \
 -DLUA_LIBRARIES="/usr/local/lib/liblua.a;m;dl" \
 -DLUA_VERSION_STRING=5.5.0
 ```
+
+Use `-DCMAKE_CXX_COMPILER=/usr/bin/g++-12` on Ubuntu 22.04. Omit it on Ubuntu 24.04 unless you intentionally want to select another compiler.
 
 Install `simdutf`:
 

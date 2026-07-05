@@ -20,6 +20,7 @@ UI_LANG="${TFS_BUILD_LANG:-}"
 JOBS="${JOBS:-}"
 HTTP="ON"
 USE_MIMALLOC="ON"
+TFS_CXX_COMPILER=""
 CLEAN_BUILD=0
 SKIP_DEPS=0
 SKIP_BUILD=0
@@ -78,6 +79,8 @@ declare -A MSG_PT=(
   [project_clone]="CMakeLists.txt nao encontrado. Clonando repositorio..."
   [project_lua_warn]="Aviso: nao encontrei a configuracao do Lua 5.5 no CMakeLists.txt."
   [project_summary]="CMake pede: C++23, Lua 5.5, OpenSSL 3, Asio, mio, simdutf, absl, fmt, spdlog, pugixml e MySQL."
+  [compiler_selected]="compilador selecionado para %s: %s"
+  [compiler_missing]="Ubuntu 22.04 precisa de %s para C++23/std::move_only_function. Rode ./build.sh sem --skip-deps para instalar as dependencias."
   [lua_ok]="Lua 5.5 ja esta OK em %s"
   [lua_pc_ok]="pkg-config do Lua 5.5 pronto: %s"
   [lua_pc_verify_failed]="pkg-config nao conseguiu validar Lua 5.5: %s"
@@ -134,6 +137,8 @@ declare -A MSG_EN=(
   [project_clone]="CMakeLists.txt not found. Cloning repository..."
   [project_lua_warn]="Warning: Lua 5.5 configuration was not found in CMakeLists.txt."
   [project_summary]="CMake requires: C++23, Lua 5.5, OpenSSL 3, Asio, mio, simdutf, absl, fmt, spdlog, pugixml and MySQL."
+  [compiler_selected]="selected compiler for %s: %s"
+  [compiler_missing]="Ubuntu 22.04 requires %s for C++23/std::move_only_function. Run ./build.sh without --skip-deps so dependencies can be installed."
   [lua_ok]="Lua 5.5 is already OK at %s"
   [lua_pc_ok]="Lua 5.5 pkg-config is ready: %s"
   [lua_pc_verify_failed]="pkg-config could not validate Lua 5.5: %s"
@@ -190,6 +195,8 @@ declare -A MSG_ES=(
   [project_clone]="CMakeLists.txt no encontrado. Clonando repositorio..."
   [project_lua_warn]="Aviso: no encontre la configuracion de Lua 5.5 en CMakeLists.txt."
   [project_summary]="CMake pide: C++23, Lua 5.5, OpenSSL 3, Asio, mio, simdutf, absl, fmt, spdlog, pugixml y MySQL."
+  [compiler_selected]="compilador seleccionado para %s: %s"
+  [compiler_missing]="Ubuntu 22.04 necesita %s para C++23/std::move_only_function. Ejecuta ./build.sh sin --skip-deps para instalar las dependencias."
   [lua_ok]="Lua 5.5 ya esta OK en %s"
   [lua_pc_ok]="pkg-config de Lua 5.5 listo: %s"
   [lua_pc_verify_failed]="pkg-config no pudo validar Lua 5.5: %s"
@@ -607,6 +614,13 @@ install_common_deps() {
     libasio-dev
   )
 
+  if [[ "${UBUNTU_TARGET}" == "22.04" ]]; then
+    packages+=(
+      gcc-12
+      g++-12
+    )
+  fi
+
   apt_install_missing "${packages[@]}"
 }
 
@@ -994,15 +1008,49 @@ cmake_prefix_path() {
   printf '%s' "${prefixes[*]}"
 }
 
+select_cxx_compiler() {
+  TFS_CXX_COMPILER=""
+
+  if [[ "${UBUNTU_TARGET}" != "22.04" ]]; then
+    return
+  fi
+
+  TFS_CXX_COMPILER="$(command -v g++-12 || true)"
+  [[ -n "${TFS_CXX_COMPILER}" ]] || die "$(printf "$(msg compiler_missing)" "g++-12")"
+
+  info "$(printf "$(msg compiler_selected)" "Ubuntu 22.04" "${TFS_CXX_COMPILER}")"
+}
+
+reset_build_dir_if_compiler_changed() {
+  local cache_file="${BUILD_DIR}/CMakeCache.txt"
+  local cached_compiler=""
+
+  [[ -n "${TFS_CXX_COMPILER}" && -f "${cache_file}" ]] || return 0
+
+  cached_compiler="$(awk -F= '$1 ~ /^CMAKE_CXX_COMPILER:/ { print $2; exit }' "${cache_file}")"
+  if [[ -n "${cached_compiler}" && "${cached_compiler}" != "${TFS_CXX_COMPILER}" ]]; then
+    safe_remove_build_dir "${BUILD_DIR}"
+  fi
+}
+
 configure_tfs() {
   local prefix_path
+  local -a compiler_args=()
+
   require_lua_for_configure
   prefix_path="$(cmake_prefix_path)"
+  select_cxx_compiler
+  reset_build_dir_if_compiler_changed
+
+  if [[ -n "${TFS_CXX_COMPILER}" ]]; then
+    compiler_args+=("-DCMAKE_CXX_COMPILER=${TFS_CXX_COMPILER}")
+  fi
 
   local -a args=(
     -S .
     -B "${BUILD_DIR}"
     -DCMAKE_BUILD_TYPE=Release
+    "${compiler_args[@]}"
     -DHTTP="${HTTP}"
     -DDISABLE_STATS=1
     -DENABLE_SLOW_TASK_DETECTION=OFF
