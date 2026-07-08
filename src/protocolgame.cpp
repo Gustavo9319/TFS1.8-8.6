@@ -524,6 +524,15 @@ bool ProtocolGame::shouldSendContainerPagination() const
 	return isOTCv8 || isAstraClient || isMehah;
 }
 
+bool ProtocolGame::shouldPaginateContainer(const Container* container) const
+{
+	if (!container) {
+		return false;
+	}
+
+	return container->hasPagination() || (isAstraClient && container->getRewardChest());
+}
+
 bool ProtocolGame::canSendAstraItemState() const
 {
 	if (!player || !player->client || !isAstraClient || isSpectator ||
@@ -547,8 +556,18 @@ bool ProtocolGame::shouldSendItemTierByte() const
 
 bool ProtocolGame::shouldSendThingUpgradeClassification() const
 {
-	return isMehah && getBoolean(ConfigManager::ITEM_TIER_DISPLAY) &&
-	       getBoolean(ConfigManager::ITEM_UPGRADE_CLASSIFICATION);
+	if (!getBoolean(ConfigManager::ITEM_TIER_DISPLAY)) {
+		return false;
+	}
+
+	if (isMehah) {
+		return getBoolean(ConfigManager::ITEM_UPGRADE_CLASSIFICATION);
+	}
+
+	// OTCv8 Classic uses this feature as the Lua-side gate for drawing tier icons.
+	// Keep the actual item wire format tied to GameItemTierByte so CIP and
+	// non-tier-aware OTC clients never receive unexpected item bytes.
+	return isOTCv8 && !isAstraClient && shouldSendItemTierByte();
 }
 
 bool ProtocolGame::shouldSendItemTierData() const
@@ -2981,6 +3000,7 @@ void ProtocolGame::sendContainer(uint8_t cid, const Container* container, bool h
 	const bool sendAstraItemState = canSendAstraItemState();
 	const bool sendAstraQuiverCountU16 = shouldSendAstraQuiverCountU16();
 	const bool sendContainerPagination = shouldSendContainerPagination();
+	const bool paginateContainer = shouldPaginateContainer(container);
 	if (container->getID() == ITEM_BROWSEFIELD) {
 		msg.addItem(ITEM_BAG, 1, sendItemTierData, sendItemTierByte, sendQuickLootFlags, sendAstraItemState,
 		            sendAstraQuiverCountU16);
@@ -2998,12 +3018,12 @@ void ProtocolGame::sendContainer(uint8_t cid, const Container* container, bool h
 	const uint32_t containerSize = container->size();
 	if (sendContainerPagination) {
 		msg.addByte(0x01); // drag and drop
-		msg.addByte(container->hasPagination() ? 0x01 : 0x00);
+		msg.addByte(paginateContainer ? 0x01 : 0x00);
 		msg.add<uint16_t>(static_cast<uint16_t>(std::min<uint32_t>(0xFFFF, containerSize)));
 		msg.add<uint16_t>(firstIndex);
 	}
 
-	const uint32_t maxItemsToSend = container->hasPagination() ? container->capacity() : 0xFF;
+	const uint32_t maxItemsToSend = paginateContainer ? container->capacity() : 0xFF;
 	const uint32_t itemCount = firstIndex >= containerSize ? 0 :
 	                           std::min<uint32_t>(maxItemsToSend, containerSize - firstIndex);
 	msg.addByte(static_cast<uint8_t>(std::min<uint32_t>(0xFF, itemCount)));
@@ -4923,7 +4943,7 @@ void ProtocolGame::sendFeatures()
 		features[GameFeature::AstraItemMetadata] = true;
 	}
 	features[GameFeature::QuickLootFlags] = shouldSendQuickLootFlags();
-	features[GameFeature::ThingUpgradeClassification] = false;
+	features[GameFeature::ThingUpgradeClassification] = shouldSendThingUpgradeClassification();
 	features[GameFeature::ItemTierByte] = shouldSendItemTierByte();
 
 	if (features.empty()) return;
