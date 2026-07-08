@@ -185,32 +185,54 @@ bool IOMapSerialize::loadItem(PropStream& propStream, Cylinder* parent)
 		}
 	} else {
 		// Stationary items like doors/beds/blackboards/bookcases
-		Item* item = nullptr;
+		Item* staticItem = nullptr;
 		if (const TileItemVector* items = tile->getItemList()) {
 			for (const auto& findItem : *items) {
 				if (findItem->getID() == id) {
-					item = findItem.get();
+					staticItem = findItem.get();
 					break;
 				} else if (iType.isDoor() && findItem->getDoor()) {
-					item = findItem.get();
+					staticItem = findItem.get();
 					break;
 				} else if (iType.isBed() && findItem->getBed()) {
-					item = findItem.get();
+					staticItem = findItem.get();
 					break;
 				}
 			}
 		}
 
-		if (item) {
-			if (item->unserializeAttr(propStream)) {
-				Container* container = item->getContainer();
+		if (staticItem) {
+			if (staticItem->unserializeAttr(propStream)) {
+				Container* container = staticItem->getContainer();
 				if (container && !loadContainer(propStream, container)) {
 					return false;
 				}
 
-				g_game.transformItem(item, id);
+				g_game.transformItem(staticItem, id);
 			} else {
 				LOG_WARN(fmt::format("WARNING: Unserialization error in IOMapSerialize::loadItem() {}", id));
+			}
+		} else if (iType.isCarpet() || iType.wrapableTo != 0) {
+			auto loadedItem = Item::CreateItem(id);
+			if (loadedItem) {
+				if (loadedItem->unserializeAttr(propStream)) {
+					Container* container = loadedItem->getContainer();
+					if (container && !loadContainer(propStream, container)) {
+						return false;
+					}
+
+					Item* raw = loadedItem.get();
+					parent->internalAddThing(raw);
+					if (!mapSerializeCylinderOwnsThing(parent, raw)) {
+						return false;
+					}
+
+					raw->startDecaying();
+					loadedItem.reset();
+				} else {
+					LOG_WARN(fmt::format("WARNING: Unserialization error in IOMapSerialize::loadItem() {}", id));
+					return false;
+				}
 			}
 		} else {
 			// The map changed since the last save, just read the attributes
@@ -267,7 +289,7 @@ void IOMapSerialize::saveTile(PropWriteStream& stream, const Tile* tile)
 		const ItemType& it = Item::items[item->getID()];
 
 		// Note that these are NEGATED, ie. these are the items that will be saved.
-		if (!(it.moveable || it.forceSerialize || item->getDoor() ||
+		if (!(it.moveable || it.forceSerialize || it.isCarpet() || it.wrapableTo != 0 || item->getDoor() ||
 		      (item->getContainer() && !item->getContainer()->empty()) || it.canWriteText || item->getBed())) {
 			continue;
 		}

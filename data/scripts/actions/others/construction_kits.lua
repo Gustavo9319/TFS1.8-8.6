@@ -1,8 +1,14 @@
 local COOLDOWN_TIME = 2 -- seconds
+local DECORATION_KIT_ID = ITEM_DECORATION_KIT or 23398
 
 local constructionKits = Action()
 
 function constructionKits.onUse(player, item, fromPosition, target, toPosition, isHotkey)
+	if item.itemid == DECORATION_KIT_ID then
+		player:sendTextMessage(MESSAGE_INFO_DESCR, "Use Wrap or Unwrap from the context menu.")
+		return true
+	end
+
 	-- Cooldown check
 	local cooldown = player:getStorageValue(PlayerStorageKeys.constructionCooldown)
 	if cooldown > os.time() then
@@ -16,10 +22,16 @@ function constructionKits.onUse(player, item, fromPosition, target, toPosition, 
 		return false
 	end
 
+	local tile = Tile(fromPosition)
+	local house = tile and tile:getHouse()
 	if fromPosition.x == CONTAINER_POSITION then
 		player:sendTextMessage(MESSAGE_INFO_DESCR, "Put the construction kit on the floor first.")
-	elseif not Tile(fromPosition):getHouse() then
+	elseif not house then
 		player:sendTextMessage(MESSAGE_INFO_DESCR, "You may construct this only inside a house.")
+	elseif not house:isInvited(player) then
+		player:sendTextMessage(MESSAGE_INFO_DESCR, "You cannot modify items in another person's house.")
+	elseif not house:canModifyItems(player) then
+		player:sendTextMessage(MESSAGE_INFO_DESCR, "You cannot modify items in this protected house.")
 	else
 		-- Apply cooldown
 		player:setStorageValue(PlayerStorageKeys.constructionCooldown, os.time() + COOLDOWN_TIME)
@@ -34,9 +46,9 @@ function constructionKits.onUse(player, item, fromPosition, target, toPosition, 
 end
 
 for id, _ in pairs(houseAutowrapItems) do
-	constructionKits:id(id)
+	if id ~= DECORATION_KIT_ID then
+		constructionKits:id(id)
+	end
 end
 
 constructionKits:register()
-
-
