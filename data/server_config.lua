@@ -6,7 +6,7 @@
 maxProtocolOutfits = 255
 -- Minimum addons required to grant outfit attributes from data/XML/outfits.xml.
 maxAddonAttributes = 3
-dllCheckKick = true
+dllCheckKick = false
 dllCheckKickTime = 5
 astraClientOnly = false
 fonticakClientOnly = false

@@ -587,6 +587,10 @@ Extended sprites:
 - [OTC-Fonticak (Fork Mehah)](https://github.com/soyfabi/OTC-Fonticak)
 - Extract `.spr` and `.dat` to your OTC directory.
 
+> [!IMPORTANT]
+> **Astra Client Asset Setup:** The Astra Client repository does not contain the required `.spr` and `.dat` sprite files at the moment. To run the Astra Client, you must download the latest OTCv8 Classic sprite assets, extract them, and place them in the appropriate directory of your Astra Client (usually under `data/things/860/`).
+> - **[Click here to download 860.rar (spr/dat)](https://github.com/Mateuzkl/Otcv8--Classic-8.6/blob/main/data/things/860.rar)**
+
 CIP client with mounts:
 
 - [Client 8.60 + DLL Mount](https://github.com/Mateuzkl/Client-cip-8.60-with-DLL-Mount)
