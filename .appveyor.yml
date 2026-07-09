@@ -26,10 +26,13 @@ cache:
 
 install:
   - cmd: git fetch --tags --force
+  - cmd: choco install ninja -y
+  - cmd: set "PATH=C:\ProgramData\chocolatey\bin;%PATH%"
+  - cmd: cd "%VCPKG_ROOT%" && git fetch origin && git checkout cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3 && .\bootstrap-vcpkg.bat && cd "%APPVEYOR_BUILD_FOLDER%"
   - cmd: call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
   - cmd: cmake --version
   - cmd: ninja --version
-  - cmd: "%VCPKG_ROOT%\vcpkg.exe" version
+  - cmd: '"%VCPKG_ROOT%\vcpkg.exe" version'
 
 build_script:
   - cmd: call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
