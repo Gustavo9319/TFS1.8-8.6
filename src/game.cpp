@@ -9,6 +9,7 @@
 #include "bed.h"
 #include "character_bazaar.h"
 #include "configmanager.h"
+#include "console_styles.h"
 #include "creature.h"
 #include "creatureevent.h"
 #include "databasetasks.h"
@@ -37,6 +38,7 @@
 #include "weapons.h"
 #include "logger.h"
 #include <fmt/format.h>
+#include <fmt/color.h>
 #include "luascript.h"
 #include "save_manager.h"
 
@@ -636,6 +638,14 @@ void Game::setGameState(GameState_t newState)
 		}
 
 		case GAME_STATE_SHUTDOWN: {
+			using namespace ConsoleStyle;
+			fmt::print("\n");
+			fmt::print(dark_gray, "    ─────────────────────────────────────────────────────────\n");
+			fmt::print(red_b,    "    ✖ SHUTTING DOWN\n");
+			fmt::print(dark_gray, "    ─────────────────────────────────────────────────────────\n");
+			fmt::print("\n");
+			std::fflush(stdout);
+
 			LOG_INFO(">> Starting shutdown sequence...");
 
 			g_globalEvents->save();
