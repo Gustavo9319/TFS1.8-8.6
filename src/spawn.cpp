@@ -166,7 +166,7 @@ bool Spawns::loadFromXml(std::string_view filename)
 					          });
 				}
 
-				spawn.addBlock(sb);
+				spawn.addBlock(std::move(sb));
 			} else if (caseInsensitiveEqual(childNode.name(), "monster")) {
 				pugi::xml_attribute nameAttribute = childNode.attribute("name");
 				if (!nameAttribute) {
@@ -353,16 +353,26 @@ void Spawns::startup()
 		return;
 	}
 
+	const size_t npcCount = getNpcCount();
+	const size_t monsterCount = getMonsterCount();
+	g_game.reserveStartupCreatures(monsterCount, npcCount);
+
+	const auto npcStart = std::chrono::steady_clock::now();
 	for (auto& npc : npcList) {
 		if (!g_game.placeCreature(npc.get(), npc->getMasterPos(), false, true)) {
 			LOG_WARN(fmt::format("[Warning - Spawns::startup] Couldn't spawn npc \"{}\" on position: {}.", npc->getName(), npc->getMasterPos()));
 		}
 	}
 	npcList.clear();
+	g_logger().info(">> NPC spawn phase: [\033[1;33m{:.3f}\033[0m] s ({} NPCs).",
+	                std::chrono::duration<double>(std::chrono::steady_clock::now() - npcStart).count(), npcCount);
 
+	const auto monsterStart = std::chrono::steady_clock::now();
 	for (const auto& spawn : spawnList) {
 		spawn->startup();
 	}
+	g_logger().info(">> Monster spawn phase: [\033[1;33m{:.3f}\033[0m] s ({} spawn blocks).",
+	                std::chrono::duration<double>(std::chrono::steady_clock::now() - monsterStart).count(), monsterCount);
 
 	started = true;
 }
@@ -549,6 +559,7 @@ bool Spawn::spawnMonster(uint32_t spawnId, const std::shared_ptr<MonsterType>& m
 
 void Spawn::startup()
 {
+	spawnedMap.reserve(spawnMap.size());
 	for (const auto& it : spawnMap) {
 		uint32_t spawnId = it.first;
 		const spawnBlock_t& sb = it.second;
@@ -698,10 +709,10 @@ void Spawn::clearMonsters()
 	spawnedMap.clear();
 }
 
-bool Spawn::addBlock(const spawnBlock_t& sb)
+bool Spawn::addBlock(spawnBlock_t sb)
 {
 	interval = std::min(interval, sb.interval);
-	spawnMap[spawnMap.size() + 1] = sb;
+	spawnMap.emplace(static_cast<uint32_t>(spawnMap.size() + 1), std::move(sb));
 
 	return true;
 }

@@ -105,18 +105,18 @@ struct Floor
 	Floor(const Floor&) = delete;
 	Floor& operator=(const Floor&) = delete;
 
-	// Pair: <Tile (real), BasicTile (cache)>
-	// BasicTile is stored during map load, real Tile is created on first access (lazy loading)
-	std::pair<std::shared_ptr<Tile>, std::shared_ptr<BasicTile>> tiles[FLOOR_SIZE][FLOOR_SIZE];
+	// Pair: <Tile (real), stable BasicTile cache id>. A four-byte id replaces
+	// one shared_ptr per populated map position.
+	std::pair<std::shared_ptr<Tile>, uint32_t> tiles[FLOOR_SIZE][FLOOR_SIZE];
 
 	// Get tile, creating from cache if needed (z is needed for tile creation)
 	Tile* getTile(uint16_t x, uint16_t y, uint8_t z);
 
 	// Set tile cache (during map load)
-	void setTileCache(uint16_t x, uint16_t y, const std::shared_ptr<BasicTile>& basicTile);
+	void setTileCache(uint16_t x, uint16_t y, const BasicTile* basicTile);
 
 	// Get tile cache
-	std::shared_ptr<BasicTile> getTileCache(uint16_t x, uint16_t y) const;
+	const BasicTile* getTileCache(uint16_t x, uint16_t y) const;
 };
 
 class FrozenPathingConditionCall;
@@ -237,8 +237,8 @@ public:
 	 * Set a tile cache (for lazy loading during map load)
 	 */
 
-	void setBasicTile(uint16_t x, uint16_t y, uint8_t z, const std::shared_ptr<BasicTile>& basicTile);
-	void setBasicTile(const Position& pos, const std::shared_ptr<BasicTile>& basicTile)
+	void setBasicTile(uint16_t x, uint16_t y, uint8_t z, const BasicTile* basicTile);
+	void setBasicTile(const Position& pos, const BasicTile* basicTile)
 	{
 		setBasicTile(pos.x, pos.y, pos.z, basicTile);
 	}
@@ -329,6 +329,13 @@ private:
 
 	QTreeNode root;
 
+	// Single-entry cache of the last leaf touched by setTile/setBasicTile.
+	// Protected by the same single-writer discipline as the quadtree itself;
+	// leaves are never freed while the Map lives, so cachedLeaf cannot dangle.
+	QTreeLeafNode* cachedLeaf = nullptr;
+	uint32_t cachedLeafBaseX = 0;
+	uint32_t cachedLeafBaseY = 0;
+
 	std::filesystem::path spawnfile;
 	std::filesystem::path housefile;
 
@@ -339,8 +346,15 @@ private:
 	                           int32_t maxRangeX, int32_t minRangeY, int32_t maxRangeY, int32_t minRangeZ,
 	                           int32_t maxRangeZ, bool onlyPlayers, bool onlyMonsters, bool onlyNpcs) const;
 
+	QTreeLeafNode* getOrCreateLeaf(uint16_t x, uint16_t y);
+	void forEachBasicFloorBlock(
+	    const std::function<void(uint16_t, uint16_t, uint8_t, const std::array<uint32_t, FLOOR_SIZE * FLOOR_SIZE>&)>& visitor) const;
+	void setBasicFloorBlock(uint16_t baseX, uint16_t baseY, uint8_t z,
+	                        const std::array<uint32_t, FLOOR_SIZE * FLOOR_SIZE>& ids);
+
 	friend class Game;
 	friend class IOMap;
+	friend class MapCache;
 };
 
 #endif // FS_MAP_H

@@ -5,6 +5,7 @@
 #include "mapcache.h"
 #include "item.h"
 #include "container.h"
+#include "definitions.h"
 #include "teleport.h"
 #include "depotlocker.h"
 #include "tile.h"
@@ -16,89 +17,528 @@
 #include "logger.h"
 
 #include <algorithm>
+#include <fstream>
+#include <openssl/evp.h>
 
 // Static cache storage with weak_ptr for automatic cleanup
-std::unordered_map<size_t, std::weak_ptr<BasicItem>> MapCache::itemCache;
-std::unordered_map<size_t, std::weak_ptr<BasicTile>> MapCache::tileCache;
-std::mutex MapCache::itemCacheMutex;
-std::mutex MapCache::tileCacheMutex;
+absl::flat_hash_map<size_t, std::weak_ptr<BasicItem>> MapCache::itemCache;
+absl::flat_hash_map<size_t, const BasicTile*> MapCache::tileCache;
+std::unordered_multimap<size_t, std::weak_ptr<BasicItem>> MapCache::itemCollisions;
+std::unordered_multimap<size_t, const BasicTile*> MapCache::tileCollisions;
+std::deque<BasicTile> MapCache::tileStore;
+bool MapCache::storeHasZones = false;
 
 // Cache statistics
-std::atomic<size_t> MapCache::itemCacheHits{0};
-std::atomic<size_t> MapCache::itemCacheMisses{0};
-std::atomic<size_t> MapCache::tileCacheHits{0};
-std::atomic<size_t> MapCache::tileCacheMisses{0};
+size_t MapCache::itemCacheHits = 0;
+size_t MapCache::itemCacheMisses = 0;
+size_t MapCache::tileCacheHits = 0;
+size_t MapCache::tileCacheMisses = 0;
 
-std::shared_ptr<BasicItem> MapCache::tryGetItemFromCache(const std::shared_ptr<BasicItem>& item) {
-    if (!item) {
-        return nullptr;
+namespace {
+constexpr std::array<uint8_t, 8> MAP_CACHE_MAGIC{{'T', 'F', 'S', 'M', 'C', '0', '1', 0}};
+constexpr uint32_t MAP_CACHE_VERSION = 2;
+constexpr uint32_t MAX_CACHE_ENTRIES = 100'000'000;
+
+std::mutex fingerprintMutex;
+std::filesystem::path fingerprintPath;
+std::optional<std::future<std::optional<MapCache::Fingerprint>>> fingerprintFuture;
+
+class CacheWriter {
+public:
+    explicit CacheWriter(const std::filesystem::path& path) : stream(path, std::ios::binary | std::ios::trunc) {}
+
+    bool good() const { return stream.good(); }
+    bool close() {
+        stream.flush();
+        const bool ok = stream.good();
+        stream.close();
+        return ok;
     }
-    
-    size_t h = item->hash();
-    
-    std::scoped_lock lock(itemCacheMutex);
-    
-    auto it = itemCache.find(h);
-    if (it != itemCache.end()) {
+
+    void bytes(const void* data, size_t size) {
+        stream.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
+    }
+
+    void u8(uint8_t value) { bytes(&value, sizeof(value)); }
+    void u16(uint16_t value) {
+        const uint8_t data[2] = {static_cast<uint8_t>(value), static_cast<uint8_t>(value >> 8)};
+        bytes(data, sizeof(data));
+    }
+    void u32(uint32_t value) {
+        const uint8_t data[4] = {static_cast<uint8_t>(value), static_cast<uint8_t>(value >> 8),
+                                 static_cast<uint8_t>(value >> 16), static_cast<uint8_t>(value >> 24)};
+        bytes(data, sizeof(data));
+    }
+    void string(std::string_view value) {
+        u32(static_cast<uint32_t>(value.size()));
+        bytes(value.data(), value.size());
+    }
+
+private:
+    std::ofstream stream;
+};
+
+class CacheReader {
+public:
+    CacheReader(const std::filesystem::path& path, uint64_t limit) : stream(path, std::ios::binary), remaining(limit) {}
+
+    bool bytes(void* data, size_t size) {
+        if (size > remaining) {
+            return false;
+        }
+        stream.read(static_cast<char*>(data), static_cast<std::streamsize>(size));
+        if (!stream) {
+            return false;
+        }
+        remaining -= size;
+        return true;
+    }
+
+    bool u8(uint8_t& value) { return bytes(&value, sizeof(value)); }
+    bool u16(uint16_t& value) {
+        uint8_t data[2];
+        if (!bytes(data, sizeof(data))) return false;
+        value = static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8);
+        return true;
+    }
+    bool u32(uint32_t& value) {
+        uint8_t data[4];
+        if (!bytes(data, sizeof(data))) return false;
+        value = static_cast<uint32_t>(data[0]) | (static_cast<uint32_t>(data[1]) << 8) |
+                (static_cast<uint32_t>(data[2]) << 16) | (static_cast<uint32_t>(data[3]) << 24);
+        return true;
+    }
+    bool string(std::string& value, uint32_t maxSize = 16 * 1024 * 1024) {
+        uint32_t size;
+        if (!u32(size) || size > maxSize || size > remaining) return false;
+        value.resize(size);
+        return bytes(value.data(), size);
+    }
+
+private:
+    std::ifstream stream;
+    uint64_t remaining;
+};
+
+std::optional<MapCache::Digest> digestFilePrefix(const std::filesystem::path& path, uint64_t bytesToHash) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) {
+        return std::nullopt;
+    }
+
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> context(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+    if (!context || EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1) {
+        return std::nullopt;
+    }
+
+    // Keep the Windows loader thread well below its default stack limit.
+    std::array<char, 64 * 1024> buffer;
+    uint64_t remaining = bytesToHash;
+    while (remaining > 0) {
+        const size_t wanted = static_cast<size_t>(std::min<uint64_t>(remaining, buffer.size()));
+        stream.read(buffer.data(), static_cast<std::streamsize>(wanted));
+        const auto read = static_cast<size_t>(stream.gcount());
+        if (read == 0 || EVP_DigestUpdate(context.get(), buffer.data(), read) != 1) {
+            return std::nullopt;
+        }
+        remaining -= read;
+    }
+
+    MapCache::Digest digest{};
+    unsigned int digestSize = 0;
+    if (EVP_DigestFinal_ex(context.get(), digest.data(), &digestSize) != 1 || digestSize != digest.size()) {
+        return std::nullopt;
+    }
+    return digest;
+}
+
+bool appendDigest(const std::filesystem::path& path) {
+    std::error_code error;
+    const uint64_t size = std::filesystem::file_size(path, error);
+    if (error) return false;
+    const auto digest = digestFilePrefix(path, size);
+    if (!digest) return false;
+    std::ofstream stream(path, std::ios::binary | std::ios::app);
+    stream.write(reinterpret_cast<const char*>(digest->data()), digest->size());
+    return stream.good();
+}
+
+bool replaceMapCacheFile(const std::filesystem::path& source, const std::filesystem::path& destination) {
+#ifdef _WIN32
+    return MoveFileExW(source.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    std::error_code error;
+    std::filesystem::rename(source, destination, error);
+    return !error;
+#endif
+}
+} // namespace
+
+void MapCache::prepare(size_t sourceBytes) {
+    // Estimates are deliberately based on the source size instead of map
+    // dimensions, which are mostly empty on large global maps.
+    itemCache.reserve(std::max<size_t>(itemCache.size(), sourceBytes / 4096));
+    tileCache.reserve(std::max<size_t>(tileCache.size(), sourceBytes / 192));
+}
+
+void MapCache::resetStore() {
+    itemCache.clear();
+    tileCache.clear();
+    itemCollisions.clear();
+    tileCollisions.clear();
+    tileStore.clear();
+    storeHasZones = false;
+    itemCacheHits = itemCacheMisses = tileCacheHits = tileCacheMisses = 0;
+}
+
+std::optional<MapCache::Digest> MapCache::digestFile(const std::filesystem::path& path) {
+    std::error_code error;
+    const uint64_t size = std::filesystem::file_size(path, error);
+    if (error) return std::nullopt;
+    const auto modified = std::filesystem::last_write_time(path, error);
+    if (error) return std::nullopt;
+    const auto digest = digestFilePrefix(path, size);
+    if (!digest) return std::nullopt;
+    const uint64_t finalSize = std::filesystem::file_size(path, error);
+    if (error || finalSize != size) return std::nullopt;
+    const auto finalModified = std::filesystem::last_write_time(path, error);
+    if (error || finalModified != modified) {
+        return std::nullopt;
+    }
+    return digest;
+}
+
+std::optional<MapCache::Fingerprint> MapCache::fingerprint(const std::filesystem::path& mapPath) {
+    std::optional<std::future<std::optional<Fingerprint>>> readyFuture;
+    {
+        std::scoped_lock lock(fingerprintMutex);
+        if (fingerprintFuture && fingerprintPath == mapPath) {
+            readyFuture.emplace(std::move(*fingerprintFuture));
+            fingerprintFuture.reset();
+            fingerprintPath.clear();
+        }
+    }
+    if (readyFuture) {
+        return readyFuture->get();
+    }
+
+    const auto mapDigest = digestFile(mapPath);
+    const auto otbDigest = digestFile("data/items/items.otb");
+    const auto xmlDigest = digestFile("data/items/items.xml");
+    if (!mapDigest || !otbDigest || !xmlDigest) {
+        return std::nullopt;
+    }
+    return Fingerprint{*mapDigest, *otbDigest, *xmlDigest};
+}
+
+void MapCache::precomputeFingerprint(const std::filesystem::path& mapPath) {
+    std::scoped_lock lock(fingerprintMutex);
+    fingerprintPath = mapPath;
+    fingerprintFuture.emplace(std::async(std::launch::async, [mapPath]() -> std::optional<Fingerprint> {
+        const auto mapDigest = digestFile(mapPath);
+        const auto otbDigest = digestFile("data/items/items.otb");
+        const auto xmlDigest = digestFile("data/items/items.xml");
+        if (!mapDigest || !otbDigest || !xmlDigest) return std::nullopt;
+        return Fingerprint{*mapDigest, *otbDigest, *xmlDigest};
+    }));
+}
+
+bool MapCache::savePersistent(const Map& map, const std::filesystem::path& cachePath,
+                              const Fingerprint& fingerprintValue, const Digest& houseCacheDigest) {
+    std::error_code error;
+    std::filesystem::create_directories(cachePath.parent_path(), error);
+    if (error) {
+        return false;
+    }
+
+    const auto tempPath = cachePath.string() + ".tmp";
+    CacheWriter writer(tempPath);
+    if (!writer.good()) {
+        return false;
+    }
+
+    std::vector<std::shared_ptr<BasicItem>> items;
+    std::unordered_map<const BasicItem*, uint32_t> itemIds;
+    std::function<uint32_t(const std::shared_ptr<BasicItem>&)> addItem = [&](const std::shared_ptr<BasicItem>& item) {
+        if (!item) return 0U;
+        if (const auto it = itemIds.find(item.get()); it != itemIds.end()) return it->second;
+        const uint32_t id = static_cast<uint32_t>(items.size() + 1);
+        itemIds.emplace(item.get(), id);
+        items.emplace_back(item);
+        for (const auto& child : item->items) addItem(child);
+        return id;
+    };
+    for (const auto& tile : tileStore) {
+        addItem(tile.ground);
+        for (const auto& item : tile.items) addItem(item);
+    }
+
+    uint32_t blockCount = 0;
+    map.forEachBasicFloorBlock([&](uint16_t, uint16_t, uint8_t,
+                                   const std::array<uint32_t, FLOOR_SIZE * FLOOR_SIZE>&) { ++blockCount; });
+
+    writer.bytes(MAP_CACHE_MAGIC.data(), MAP_CACHE_MAGIC.size());
+    writer.u32(MAP_CACHE_VERSION);
+    writer.u32(CLIENT_VERSION_MIN);
+    writer.u32(Item::items.majorVersion);
+    writer.u32(Item::items.minorVersion);
+    writer.u32(Item::items.buildNumber);
+    writer.bytes(fingerprintValue.map.data(), fingerprintValue.map.size());
+    writer.bytes(fingerprintValue.itemsOtb.data(), fingerprintValue.itemsOtb.size());
+    writer.bytes(fingerprintValue.itemsXml.data(), fingerprintValue.itemsXml.size());
+    writer.bytes(houseCacheDigest.data(), houseCacheDigest.size());
+    writer.u32(map.width);
+    writer.u32(map.height);
+    writer.string(map.spawnfile.generic_string());
+    writer.string(map.housefile.generic_string());
+    writer.u32(static_cast<uint32_t>(items.size()));
+    writer.u32(static_cast<uint32_t>(tileStore.size()));
+    writer.u32(blockCount);
+
+    for (const auto& item : items) {
+        writer.u16(item->id);
+        writer.u16(item->charges);
+        writer.u16(item->actionId);
+        writer.u16(item->uniqueId);
+        writer.u16(item->destX);
+        writer.u16(item->destY);
+        writer.u16(item->doorOrDepotId);
+        writer.u8(item->destZ);
+        writer.string(item->text);
+        writer.u32(static_cast<uint32_t>(item->items.size()));
+        for (const auto& child : item->items) writer.u32(itemIds.at(child.get()));
+    }
+
+    for (const auto& tile : tileStore) {
+        writer.u32(tile.ground ? itemIds.at(tile.ground.get()) : 0);
+        writer.u32(static_cast<uint32_t>(tile.items.size()));
+        for (const auto& item : tile.items) writer.u32(itemIds.at(item.get()));
+        writer.u32(static_cast<uint32_t>(tile.zoneIds.size()));
+        for (ZoneId id : tile.zoneIds) writer.u16(id);
+        writer.u32(tile.flags);
+        writer.u32(tile.houseId);
+        writer.u8(tile.isStatic ? 1 : 0);
+    }
+
+    map.forEachBasicFloorBlock([&](uint16_t x, uint16_t y, uint8_t z,
+                                   const std::array<uint32_t, FLOOR_SIZE * FLOOR_SIZE>& ids) {
+        writer.u16(x);
+        writer.u16(y);
+        writer.u8(z);
+        for (uint32_t id : ids) writer.u32(id);
+    });
+
+    if (!writer.good() || !writer.close()) {
+        std::filesystem::remove(tempPath, error);
+        return false;
+    }
+    if (!appendDigest(tempPath)) {
+        std::filesystem::remove(tempPath, error);
+        return false;
+    }
+
+    if (!replaceMapCacheFile(tempPath, cachePath)) {
+        std::filesystem::remove(tempPath, error);
+        return false;
+    }
+
+    g_logger().info(">> Wrote persistent map cache '{}' ({} items, {} tiles, {} floor blocks).",
+                    cachePath.string(), items.size(), tileStore.size(), blockCount);
+    return true;
+}
+
+bool MapCache::loadPersistent(Map& map, const std::filesystem::path& cachePath,
+                              const Fingerprint& expectedFingerprint, const Digest& expectedHouseDigest) {
+    std::error_code error;
+    const uint64_t fileSize = std::filesystem::file_size(cachePath, error);
+    if (error || fileSize < MAP_CACHE_MAGIC.size() + 4 + 32) {
+        return false;
+    }
+
+    Digest storedChecksum{};
+    {
+        std::ifstream tail(cachePath, std::ios::binary);
+        tail.seekg(static_cast<std::streamoff>(fileSize - storedChecksum.size()));
+        tail.read(reinterpret_cast<char*>(storedChecksum.data()), storedChecksum.size());
+        if (!tail) return false;
+    }
+    const auto actualChecksum = digestFilePrefix(cachePath, fileSize - storedChecksum.size());
+    if (!actualChecksum || *actualChecksum != storedChecksum) {
+        g_logger().warn(">> Persistent map cache checksum mismatch: {}", cachePath.string());
+        return false;
+    }
+
+    CacheReader reader(cachePath, fileSize - storedChecksum.size());
+    std::array<uint8_t, 8> magic{};
+    uint32_t version = 0;
+    uint32_t clientVersion = 0, itemMajor = 0, itemMinor = 0, itemBuild = 0;
+    Fingerprint storedFingerprint;
+    Digest storedHouseDigest{};
+    if (!reader.bytes(magic.data(), magic.size()) || magic != MAP_CACHE_MAGIC || !reader.u32(version) ||
+        version != MAP_CACHE_VERSION || !reader.u32(clientVersion) || !reader.u32(itemMajor) ||
+        !reader.u32(itemMinor) || !reader.u32(itemBuild) || clientVersion != CLIENT_VERSION_MIN ||
+        itemMajor != Item::items.majorVersion || itemMinor != Item::items.minorVersion ||
+        itemBuild != Item::items.buildNumber ||
+        !reader.bytes(storedFingerprint.map.data(), storedFingerprint.map.size()) ||
+        !reader.bytes(storedFingerprint.itemsOtb.data(), storedFingerprint.itemsOtb.size()) ||
+        !reader.bytes(storedFingerprint.itemsXml.data(), storedFingerprint.itemsXml.size()) ||
+        !reader.bytes(storedHouseDigest.data(), storedHouseDigest.size()) ||
+        storedFingerprint != expectedFingerprint || storedHouseDigest != expectedHouseDigest) {
+        return false;
+    }
+
+    uint32_t width = 0, height = 0, itemCount = 0, tileCount = 0, blockCount = 0;
+    std::string spawnFile, houseFile;
+    if (!reader.u32(width) || !reader.u32(height) || !reader.string(spawnFile, 64 * 1024) ||
+        !reader.string(houseFile, 64 * 1024) || !reader.u32(itemCount) || !reader.u32(tileCount) ||
+        !reader.u32(blockCount) || itemCount > MAX_CACHE_ENTRIES || tileCount > MAX_CACHE_ENTRIES ||
+        blockCount > MAX_CACHE_ENTRIES) {
+        return false;
+    }
+
+    struct PendingItem {
+        std::shared_ptr<BasicItem> item;
+        std::vector<uint32_t> children;
+    };
+    std::vector<PendingItem> pendingItems;
+    pendingItems.reserve(itemCount);
+    for (uint32_t i = 0; i < itemCount; ++i) {
+        auto item = std::make_shared<BasicItem>();
+        uint32_t childCount = 0;
+        if (!reader.u16(item->id) || !reader.u16(item->charges) || !reader.u16(item->actionId) ||
+            !reader.u16(item->uniqueId) || !reader.u16(item->destX) || !reader.u16(item->destY) ||
+            !reader.u16(item->doorOrDepotId) || !reader.u8(item->destZ) || !reader.string(item->text) ||
+            !reader.u32(childCount) || childCount > MAX_CACHE_ENTRIES) {
+            return false;
+        }
+        PendingItem pending{std::move(item), std::vector<uint32_t>(childCount)};
+        for (uint32_t& child : pending.children) if (!reader.u32(child)) return false;
+        pendingItems.emplace_back(std::move(pending));
+    }
+    for (auto& pending : pendingItems) {
+        pending.item->items.reserve(pending.children.size());
+        for (uint32_t child : pending.children) {
+            if (child == 0 || child > pendingItems.size()) return false;
+            pending.item->items.emplace_back(pendingItems[child - 1].item);
+        }
+    }
+
+    resetStore();
+    for (uint32_t i = 0; i < tileCount; ++i) {
+        BasicTile tile;
+        uint32_t groundId = 0, tileItemCount = 0, zoneCount = 0;
+        if (!reader.u32(groundId) || !reader.u32(tileItemCount) || tileItemCount > MAX_CACHE_ENTRIES) return false;
+        if (groundId > pendingItems.size()) return false;
+        if (groundId != 0) tile.ground = pendingItems[groundId - 1].item;
+        tile.items.reserve(tileItemCount);
+        for (uint32_t j = 0; j < tileItemCount; ++j) {
+            uint32_t itemId;
+            if (!reader.u32(itemId) || itemId == 0 || itemId > pendingItems.size()) return false;
+            tile.items.emplace_back(pendingItems[itemId - 1].item);
+        }
+        if (!reader.u32(zoneCount) || zoneCount > std::numeric_limits<uint16_t>::max()) return false;
+        tile.zoneIds.resize(zoneCount);
+        for (ZoneId& zone : tile.zoneIds) if (!reader.u16(zone)) return false;
+        uint8_t isStatic = 0;
+        if (!reader.u32(tile.flags) || !reader.u32(tile.houseId) || !reader.u8(isStatic)) return false;
+        tile.isStatic = isStatic != 0;
+        tile.cacheId = i + 1;
+        storeHasZones |= !tile.zoneIds.empty();
+        tileStore.emplace_back(std::move(tile));
+    }
+
+    // The complete payload checksum has already been verified, so floor
+    // blocks can be installed as a stream instead of allocating another
+    // ~90 MB staging vector for the global map.
+    map.width = width;
+    map.height = height;
+    map.spawnfile = std::filesystem::path(spawnFile);
+    map.housefile = std::filesystem::path(houseFile);
+    for (uint32_t i = 0; i < blockCount; ++i) {
+        uint16_t x = 0, y = 0;
+        uint8_t z = 0;
+        std::array<uint32_t, FLOOR_SIZE * FLOOR_SIZE> ids{};
+        if (!reader.u16(x) || !reader.u16(y) || !reader.u8(z)) return false;
+        for (uint32_t& id : ids) {
+            if (!reader.u32(id) || id > tileStore.size()) return false;
+        }
+        map.setBasicFloorBlock(x, y, z, ids);
+    }
+
+    g_logger().info(">> Loaded persistent map cache '{}' ({} items, {} tiles, {} floor blocks).",
+                    cachePath.string(), itemCount, tileCount, blockCount);
+    return true;
+}
+
+std::shared_ptr<BasicItem> MapCache::tryGetItemFromCache(BasicItem&& item) {
+    const size_t h = item.hash();
+    bool hasPrimary = false;
+    if (auto it = itemCache.find(h); it != itemCache.end()) {
         if (auto cached = it->second.lock()) {
-            // Verify hash collision
-            if (*cached == *item) {
+            hasPrimary = true;
+            if (*cached == item) {
                 ++itemCacheHits;
                 return cached;
-            } else {
-                // #ifdef _DEBUG
-                // LOG_WARN(fmt::format("[MapCache] Hash collision detected for item ID {} (hash: {})", 
-                //                        item->id, h));
-                // #endif
             }
         } else {
-            // Expired weak_ptr, remove it
             itemCache.erase(it);
         }
     }
-    
-    ++itemCacheMisses;
-    itemCache[h] = item;
-    return item;
-}
-
-std::shared_ptr<BasicTile> MapCache::tryGetTileFromCache(const std::shared_ptr<BasicTile>& tile) {
-    if (!tile) {
-        return nullptr;
-    }
-    
-    size_t h = tile->hash();
-    
-    std::scoped_lock lock(tileCacheMutex);
-    
-    auto it = tileCache.find(h);
-    if (it != tileCache.end()) {
-        if (auto cached = it->second.lock()) {
-            // Verify hash collision
-            if (*cached == *tile) {
-                ++tileCacheHits;
-                return cached;
-            } else {
-                // #ifdef _DEBUG
-                // LOG_WARN(fmt::format("[MapCache] Hash collision detected for tile (hash: {})", h));
-                // #endif
-            }
-        } else {
-            // Expired weak_ptr, remove it
-            tileCache.erase(it);
+    const auto [begin, end] = itemCollisions.equal_range(h);
+    for (auto it = begin; it != end; ++it) {
+        if (auto cached = it->second.lock(); cached && *cached == item) {
+            ++itemCacheHits;
+            return cached;
         }
     }
-    
+
+    ++itemCacheMisses;
+    auto stored = std::make_shared<BasicItem>(std::move(item));
+    if (hasPrimary) itemCollisions.emplace(h, stored);
+    else itemCache.emplace(h, stored);
+    return stored;
+}
+
+const BasicTile* MapCache::tryGetTileFromCache(BasicTile&& tile) {
+    const size_t h = tile.hash();
+    bool hasPrimary = false;
+    if (auto it = tileCache.find(h); it != tileCache.end()) {
+        const BasicTile* cached = it->second;
+        hasPrimary = true;
+        if (*cached == tile) {
+            ++tileCacheHits;
+            return cached;
+        }
+    }
+    const auto [begin, end] = tileCollisions.equal_range(h);
+    for (auto it = begin; it != end; ++it) {
+        const BasicTile* cached = it->second;
+        if (*cached == tile) {
+            ++tileCacheHits;
+            return cached;
+        }
+    }
+
     ++tileCacheMisses;
-    tileCache[h] = tile;
-    return tile;
+    tile.cacheId = static_cast<uint32_t>(tileStore.size() + 1);
+    storeHasZones |= !tile.zoneIds.empty();
+    tileStore.emplace_back(std::move(tile));
+    const BasicTile* stored = &tileStore.back();
+    if (hasPrimary) tileCollisions.emplace(h, stored);
+    else tileCache.emplace(h, stored);
+    return stored;
+}
+
+const BasicTile* MapCache::getTileById(uint32_t id) {
+    if (id == 0 || id > tileStore.size()) {
+        return nullptr;
+    }
+    return &tileStore[id - 1];
 }
 
 void MapCache::flush() {
-    std::scoped_lock lock(itemCacheMutex, tileCacheMutex);
-    
-    size_t itemCount = itemCache.size();
-    size_t tileCount = tileCache.size();
+    size_t itemCount = itemCache.size() + itemCollisions.size();
+    size_t tileCount = tileCache.size() + tileCollisions.size();
     
     // Calculate hit rates
     size_t totalItemRequests = itemCacheHits + itemCacheMisses;
@@ -111,12 +551,14 @@ void MapCache::flush() {
     
     itemCache.clear();
     tileCache.clear();
+    itemCollisions.clear();
+    tileCollisions.clear();
     
     LOG_INFO(fmt::format(">> Map cache flushed: [\033[1;36m{}\033[0m] unique items, [\033[1;36m{}\033[0m] unique tiles deduplicated", 
                          itemCount, tileCount));
     LOG_INFO(fmt::format(">> Cache hit rates: Items [\033[1;33m{:.2f}%\033[0m] (\033[1;36m{}\033[0m/\033[1;36m{}\033[0m), Tiles [\033[1;33m{:.2f}%\033[0m] (\033[1;36m{}\033[0m/\033[1;36m{}\033[0m)",
-                         itemHitRate, itemCacheHits.load(), totalItemRequests,
-                         tileHitRate, tileCacheHits.load(), totalTileRequests));
+                         itemHitRate, itemCacheHits, totalItemRequests,
+                         tileHitRate, tileCacheHits, totalTileRequests));
     
     // Reset counters
     itemCacheHits = 0;
@@ -126,26 +568,25 @@ void MapCache::flush() {
 }
 
 void MapCache::cleanupExpiredEntries() {
-    {
-        std::scoped_lock lock(itemCacheMutex);
-        std::erase_if(itemCache, [](const auto& entry) { return entry.second.expired(); });
+    for (auto it = itemCache.begin(); it != itemCache.end();) {
+        if (it->second.expired()) itemCache.erase(it++);
+        else ++it;
     }
-    
-    {
-        std::scoped_lock lock(tileCacheMutex);
-        std::erase_if(tileCache, [](const auto& entry) { return entry.second.expired(); });
-    }
+    std::erase_if(itemCollisions, [](const auto& entry) { return entry.second.expired(); });
 }
 
 size_t MapCache::getItemCacheSize() {
-    std::scoped_lock lock(itemCacheMutex);
-    return itemCache.size();
+    return itemCache.size() + itemCollisions.size();
 }
 
 size_t MapCache::getTileCacheSize() {
-    std::scoped_lock lock(tileCacheMutex);
-    return tileCache.size();
+    return tileCache.size() + tileCollisions.size();
 }
+
+size_t MapCache::getItemCacheHits() { return itemCacheHits; }
+size_t MapCache::getItemCacheMisses() { return itemCacheMisses; }
+size_t MapCache::getTileCacheHits() { return tileCacheHits; }
+size_t MapCache::getTileCacheMisses() { return tileCacheMisses; }
 
 // Helper functions for parsing
 namespace {
@@ -247,25 +688,24 @@ namespace {
 }
 
 // Helper to parse item from stream (used by both node-based and inline items)
-std::shared_ptr<BasicItem> parseBasicItemFromStream(PropStream& propStream) {
+bool parseBasicItemFromStream(PropStream& propStream, BasicItem& item) {
     uint16_t id;
     if (!propStream.read<uint16_t>(id)) {
         LOG_ERROR("[MapCache] Failed to read item ID from stream");
-        return nullptr;
+        return false;
     }
     
     // ID substitutions
     applyItemIdSubstitutions(id);
 
-    auto item = std::make_shared<BasicItem>();
-    item->id = id;
+    item.id = id;
     
     // Default values based on ItemType
     const ItemType& it = Item::items[id];
     if (it.stackable && it.charges == 0) {
-        item->charges = 1;
+        item.charges = 1;
     } else if (it.charges != 0) {
-        item->charges = it.charges;
+        item.charges = it.charges;
     }
     
     // Read attributes
@@ -276,7 +716,7 @@ std::shared_ptr<BasicItem> parseBasicItemFromStream(PropStream& propStream) {
             case ATTR_RUNE_CHARGES: {
                 uint8_t count;
                 if (propStream.read<uint8_t>(count)) {
-                    item->charges = count;
+                    item.charges = count;
                 }
                 break;
             }
@@ -284,7 +724,7 @@ std::shared_ptr<BasicItem> parseBasicItemFromStream(PropStream& propStream) {
             case ATTR_CHARGES: {
                 uint16_t charges;
                 if (propStream.read<uint16_t>(charges)) {
-                    item->charges = charges;
+                    item.charges = charges;
                 }
                 break;
             }
@@ -292,7 +732,7 @@ std::shared_ptr<BasicItem> parseBasicItemFromStream(PropStream& propStream) {
             case ATTR_ACTION_ID: {
                 uint16_t actionId;
                 if (propStream.read<uint16_t>(actionId)) {
-                    item->actionId = actionId;
+                    item.actionId = actionId;
                 }
                 break;
             }
@@ -300,7 +740,7 @@ std::shared_ptr<BasicItem> parseBasicItemFromStream(PropStream& propStream) {
             case ATTR_UNIQUE_ID: {
                 uint16_t uniqueId;
                 if (propStream.read<uint16_t>(uniqueId)) {
-                    item->uniqueId = uniqueId;
+                    item.uniqueId = uniqueId;
                 }
                 break;
             }
@@ -308,7 +748,7 @@ std::shared_ptr<BasicItem> parseBasicItemFromStream(PropStream& propStream) {
             case ATTR_TEXT: {
                 auto [text, ok] = propStream.readString();
                 if (ok) {
-                    item->text = std::string(text);
+                    item.text = std::string(text);
                 }
                 break;
             }
@@ -316,9 +756,9 @@ std::shared_ptr<BasicItem> parseBasicItemFromStream(PropStream& propStream) {
             case ATTR_TELE_DEST: {
                 OTBM_Destination_coords dest;
                 if (propStream.read(dest)) {
-                    item->destX = dest.x;
-                    item->destY = dest.y;
-                    item->destZ = dest.z;
+                    item.destX = dest.x;
+                    item.destY = dest.y;
+                    item.destZ = dest.z;
                 }
                 break;
             }
@@ -326,7 +766,7 @@ std::shared_ptr<BasicItem> parseBasicItemFromStream(PropStream& propStream) {
             case ATTR_HOUSEDOORID: {
                 uint8_t doorId;
                 if (propStream.read<uint8_t>(doorId)) {
-                    item->doorOrDepotId = doorId;
+                    item.doorOrDepotId = doorId;
                 }
                 break;
             }
@@ -334,7 +774,7 @@ std::shared_ptr<BasicItem> parseBasicItemFromStream(PropStream& propStream) {
             case ATTR_DEPOT_ID: {
                 uint16_t depotId;
                 if (propStream.read<uint16_t>(depotId)) {
-                    item->doorOrDepotId = depotId;
+                    item.doorOrDepotId = depotId;
                 }
                 break;
             }
@@ -405,11 +845,10 @@ std::shared_ptr<BasicItem> parseBasicItemFromStream(PropStream& propStream) {
                 break;
         }
     }
-    return item;
+    return true;
 }
 
-std::shared_ptr<BasicItem> MapCache::parseBasicItem(void* loaderptr, const void* nodeptr, BasicItem* parent) {
-    (void)parent;
+std::shared_ptr<BasicItem> MapCache::parseBasicItem(void* loaderptr, const void* nodeptr) {
     OTB::Loader& loader = *static_cast<OTB::Loader*>(loaderptr);
     const OTB::Node& node = *static_cast<const OTB::Node*>(nodeptr);
     PropStream propStream;
@@ -419,25 +858,25 @@ std::shared_ptr<BasicItem> MapCache::parseBasicItem(void* loaderptr, const void*
         return nullptr;
     }
 
-    auto item = parseBasicItemFromStream(propStream);
-    if (!item) {
+    BasicItem item;
+    if (!parseBasicItemFromStream(propStream, item)) {
         return nullptr;
     }
     
     // Parse children (containers)
     for (auto& childNode : node.children) {
         if (static_cast<OTBM_NodeTypes_t>(childNode.type) == OTBM_NodeTypes_t::ITEM) {
-            auto child = parseBasicItem(loaderptr, &childNode, item.get());
+            auto child = parseBasicItem(loaderptr, &childNode);
             if (child) {
-                item->items.push_back(child);
+                item.items.push_back(child);
             }
         }
     }
 
-    return tryGetItemFromCache(item);
+    return tryGetItemFromCache(std::move(item));
 }
 
-std::shared_ptr<BasicTile> MapCache::parseBasicTile(void* loaderptr, const void* nodeptr, uint8_t& xOffset, uint8_t& yOffset) {
+const BasicTile* MapCache::parseBasicTile(void* loaderptr, const void* nodeptr, uint8_t& xOffset, uint8_t& yOffset) {
     OTB::Loader& loader = *static_cast<OTB::Loader*>(loaderptr);
     const OTB::Node& tileNode = *static_cast<const OTB::Node*>(nodeptr);
     PropStream propStream;
@@ -456,13 +895,13 @@ std::shared_ptr<BasicTile> MapCache::parseBasicTile(void* loaderptr, const void*
     xOffset = tile_coord.x;
     yOffset = tile_coord.y;
     
-    auto tile = std::make_shared<BasicTile>();
+    BasicTile tile;
     
     // Check for HouseTile
     if (static_cast<OTBM_NodeTypes_t>(tileNode.type) == OTBM_NodeTypes_t::HOUSETILE) {
         uint32_t houseId;
         if (propStream.read<uint32_t>(houseId)) {
-            tile->houseId = houseId;
+            tile.houseId = houseId;
         } else {
             LOG_ERROR("[MapCache] Failed to read house ID from house tile");
         }
@@ -475,10 +914,10 @@ std::shared_ptr<BasicTile> MapCache::parseBasicTile(void* loaderptr, const void*
             case OTBM_AttrTypes_t::TILE_FLAGS: {
                 uint32_t flags;
                 if (propStream.read<uint32_t>(flags)) {
-                    if ((flags & tfs::to_underlying(OTBM_TileFlag_t::PROTECTIONZONE)) != 0) tile->flags |= TILESTATE_PROTECTIONZONE;
-                    if ((flags & tfs::to_underlying(OTBM_TileFlag_t::NOPVPZONE)) != 0) tile->flags |= TILESTATE_NOPVPZONE;
-                    if ((flags & tfs::to_underlying(OTBM_TileFlag_t::PVPZONE)) != 0) tile->flags |= TILESTATE_PVPZONE;
-                    if ((flags & tfs::to_underlying(OTBM_TileFlag_t::NOLOGOUT)) != 0) tile->flags |= TILESTATE_NOLOGOUT;
+                    if ((flags & tfs::to_underlying(OTBM_TileFlag_t::PROTECTIONZONE)) != 0) tile.flags |= TILESTATE_PROTECTIONZONE;
+                    if ((flags & tfs::to_underlying(OTBM_TileFlag_t::NOPVPZONE)) != 0) tile.flags |= TILESTATE_NOPVPZONE;
+                    if ((flags & tfs::to_underlying(OTBM_TileFlag_t::PVPZONE)) != 0) tile.flags |= TILESTATE_PVPZONE;
+                    if ((flags & tfs::to_underlying(OTBM_TileFlag_t::NOLOGOUT)) != 0) tile.flags |= TILESTATE_NOLOGOUT;
                     if ((flags & tfs::to_underlying(OTBM_TileFlag_t::ZONE)) != 0) {
                         ZoneId zoneId = 0;
                         do {
@@ -488,7 +927,7 @@ std::shared_ptr<BasicTile> MapCache::parseBasicTile(void* loaderptr, const void*
                             }
 
                             if (zoneId != 0) {
-                                tile->zoneIds.emplace_back(zoneId);
+                                tile.zoneIds.emplace_back(zoneId);
                             }
                         } while (zoneId != 0);
                     }
@@ -500,13 +939,13 @@ std::shared_ptr<BasicTile> MapCache::parseBasicTile(void* loaderptr, const void*
             }
             case OTBM_AttrTypes_t::ITEM: {
                 // Inline item
-                auto item = parseBasicItemFromStream(propStream);
-                if (item) {
-                     const ItemType& it = Item::items[item->id];
+                BasicItem item;
+                if (parseBasicItemFromStream(propStream, item)) {
+                     const ItemType& it = Item::items[item.id];
                      if (it.isGroundTile()) {
-                         tile->ground = MapCache::tryGetItemFromCache(item);
+                         tile.ground = MapCache::tryGetItemFromCache(std::move(item));
                      } else {
-                         tile->items.push_back(MapCache::tryGetItemFromCache(item));
+                         tile.items.push_back(MapCache::tryGetItemFromCache(std::move(item)));
                      }
                 }
                 break; 
@@ -521,28 +960,28 @@ std::shared_ptr<BasicTile> MapCache::parseBasicTile(void* loaderptr, const void*
     for (auto& itemNode : tileNode.children) {
         const auto childNodeType = static_cast<OTBM_NodeTypes_t>(itemNode.type);
         if (childNodeType == OTBM_NodeTypes_t::ITEM) {
-            auto item = parseBasicItem(loaderptr, &itemNode, nullptr);
+            auto item = parseBasicItem(loaderptr, &itemNode);
             if (item) {
                 const ItemType& it = Item::items[item->id];
-                if (it.isGroundTile() && tile->ground == nullptr) {
-                    tile->ground = item;
+                if (it.isGroundTile() && tile.ground == nullptr) {
+                    tile.ground = item;
                 } else {
-                    tile->items.push_back(item);
+                    tile.items.push_back(item);
                 }
             }
         } else if (childNodeType == OTBM_NodeTypes_t::TILE_ZONE) {
             std::string errorType;
-            if (!IOMap::parseTileZoneNode(loader, itemNode, tile->zoneIds, errorType)) {
+            if (!IOMap::parseTileZoneNode(loader, itemNode, tile.zoneIds, errorType)) {
                 LOG_ERROR(fmt::format("[MapCache] {}", errorType));
                 return nullptr;
             }
         }
     }
 
-    std::sort(tile->zoneIds.begin(), tile->zoneIds.end());
-    tile->zoneIds.erase(std::unique(tile->zoneIds.begin(), tile->zoneIds.end()), tile->zoneIds.end());
+    std::sort(tile.zoneIds.begin(), tile.zoneIds.end());
+    tile.zoneIds.erase(std::unique(tile.zoneIds.begin(), tile.zoneIds.end()), tile.zoneIds.end());
     
-    return tryGetTileFromCache(tile);
+    return tryGetTileFromCache(std::move(tile));
 }
 
 /**
@@ -615,7 +1054,7 @@ std::shared_ptr<Item> createItemFromBasic(const std::shared_ptr<BasicItem>& basi
     return item;
 }
 
-std::unique_ptr<Tile> createTileFromBasic(const std::shared_ptr<BasicTile>& basicTile, 
+std::unique_ptr<Tile> createTileFromBasic(const BasicTile* basicTile,
                                            uint16_t x, uint16_t y, uint8_t z,
                                            Houses& houses) {
     if (!basicTile) {

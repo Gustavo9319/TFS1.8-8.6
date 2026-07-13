@@ -618,22 +618,43 @@ void Game::setGameState(GameState_t newState)
 	gameState.store(newState, std::memory_order_release);
 	switch (newState) {
 		case GAME_STATE_INIT: {
+			const auto initStart = std::chrono::steady_clock::now();
+			auto logStartupPhase = [](std::string_view name, std::chrono::steady_clock::time_point start) {
+				g_logger().info(">> Startup phase '{}': [\033[1;33m{:.3f}\033[0m] s.", name,
+				                std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+			};
+
+			auto phaseStart = std::chrono::steady_clock::now();
 			groups.load();
 			g_chat->load();
+			logStartupPhase("groups and chat", phaseStart);
 
+			const auto spawnsStart = std::chrono::steady_clock::now();
 			map.spawns.startup();
+			g_logger().info(">> Spawn creation phase: [\033[1;33m{:.3f}\033[0m] s.",
+			                std::chrono::duration<double>(std::chrono::steady_clock::now() - spawnsStart).count());
 
+			phaseStart = std::chrono::steady_clock::now();
 			mounts.loadFromXml();
+			logStartupPhase("mounts", phaseStart);
 
+			phaseStart = std::chrono::steady_clock::now();
 			raids.loadFromXml();
 			raids.startup();
+			logStartupPhase("raids", phaseStart);
 
+			phaseStart = std::chrono::steady_clock::now();
 			loadMotdNum();
 			loadPlayersRecord();
 			loadGameStorageValues();
 			loadAccountStorageValues();
+			logStartupPhase("startup storage", phaseStart);
 
+			phaseStart = std::chrono::steady_clock::now();
 			g_globalEvents->startup();
+			logStartupPhase("global events", phaseStart);
+			g_logger().info(">> GAME_STATE_INIT phase: [\033[1;33m{:.3f}\033[0m] s.",
+			                std::chrono::duration<double>(std::chrono::steady_clock::now() - initStart).count());
 			break;
 		}
 
@@ -5912,6 +5933,18 @@ void Game::addCreatureCheck(Creature* creature)
 
 	creature->inCheckCreaturesVector = true;
 	checkCreatureLists[uniform_random(0, EVENT_CREATURECOUNT - 1)].push_back(getCreatureSharedRef(creature));
+}
+
+void Game::reserveStartupCreatures(size_t monsterCount, size_t npcCount)
+{
+	const size_t total = monsterCount + npcCount;
+	creatureSharedRefs.reserve(creatureSharedRefs.size() + total);
+	monsters.reserve(monsters.size() + monsterCount);
+	npcs.reserve(npcs.size() + npcCount);
+	const size_t perCheckList = (total + EVENT_CREATURECOUNT - 1) / EVENT_CREATURECOUNT;
+	for (auto& list : checkCreatureLists) {
+		list.reserve(list.size() + perCheckList);
+	}
 }
 
 void Game::removeCreatureCheck(Creature* creature)
