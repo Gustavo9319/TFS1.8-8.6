@@ -48,6 +48,8 @@ Vocations g_vocations;
 
 namespace {
 
+std::optional<double> startupMapLoadSeconds;
+
 std::pair<bool, LogLevel> getLogToFileFromConfig(const std::string& configFile)
 {
 	lua_State* L = luaL_newstate();
@@ -396,12 +398,14 @@ void mainLoader(const std::shared_ptr<ServiceManager>& services)
 	}
 	LOG_INFO(fmt::format(">> {}", asUpperCaseString(worldType)));
 
+	startupMapLoadSeconds.reset();
 	const auto mapStartupStart = std::chrono::steady_clock::now();
 	LOG_INFO(">> Loading map");
 	if (!g_game.loadMainMap(std::string{getString(ConfigManager::MAP_NAME)})) {
 		startupErrorMessage("Failed to load map");
 		return;
 	}
+	startupMapLoadSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - mapStartupStart).count();
 
 	LOG_INFO(">> Initializing gamestate");
 	g_game.setGameState(GAME_STATE_INIT);
@@ -504,6 +508,12 @@ void startServer()
 		fmt::print(white_b, "{}\n", getString(ConfigManager::MAP_NAME));
 		fmt::print(gray, "    {:<20}", "World Size");
 		fmt::print(white_b, "{}x{}\n", g_game.map.getWidth(), g_game.map.getHeight());
+		fmt::print(gray, "    {:<20}", "Map Load Time");
+		if (startupMapLoadSeconds) {
+			fmt::print(green_b, "{:.3f} s \u2714\n", *startupMapLoadSeconds);
+		} else {
+			fmt::print(dark_gray, "unavailable\n");
+		}
 		fmt::print(gray, "    {:<20}", "World Type");
 		fmt::print(white_b, "{}\n", getString(ConfigManager::WORLD_TYPE));
 		fmt::print(gray, "    {:<20}", "Account Manager");
