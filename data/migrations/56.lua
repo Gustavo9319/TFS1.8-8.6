@@ -1,5 +1,5 @@
 function onUpdateDatabase()
-	logMigration("Updating database to version 55 (character bazaar)")
+	logMigration("Updating database to version 57 (repair Character Bazaar and hot-path indexes)")
 
 	local queries = {
 		[[CREATE TABLE IF NOT EXISTS `character_auctions` (
@@ -39,7 +39,7 @@ function onUpdateDatabase()
 			CONSTRAINT `fk_character_auctions_seller` FOREIGN KEY (`seller_account_id`) REFERENCES `accounts` (`id`) ON DELETE CASCADE,
 			CONSTRAINT `fk_character_auctions_bidder` FOREIGN KEY (`current_bidder_account_id`) REFERENCES `accounts` (`id`) ON DELETE SET NULL,
 			CONSTRAINT `fk_character_auctions_winner` FOREIGN KEY (`winner_account_id`) REFERENCES `accounts` (`id`) ON DELETE SET NULL
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;]],
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4]],
 		[[CREATE TABLE IF NOT EXISTS `character_auction_bids` (
 			`id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
 			`auction_id` INT UNSIGNED NOT NULL,
@@ -51,7 +51,7 @@ function onUpdateDatabase()
 			KEY `idx_character_auction_bids_bidder` (`bidder_account_id`, `created_at`),
 			CONSTRAINT `fk_character_auction_bids_auction` FOREIGN KEY (`auction_id`) REFERENCES `character_auctions` (`id`) ON DELETE CASCADE,
 			CONSTRAINT `fk_character_auction_bids_bidder` FOREIGN KEY (`bidder_account_id`) REFERENCES `accounts` (`id`) ON DELETE CASCADE
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;]],
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4]],
 		[[CREATE TABLE IF NOT EXISTS `character_auction_history` (
 			`id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
 			`auction_id` INT UNSIGNED NOT NULL,
@@ -66,14 +66,39 @@ function onUpdateDatabase()
 			CONSTRAINT `fk_character_auction_history_auction` FOREIGN KEY (`auction_id`) REFERENCES `character_auctions` (`id`) ON DELETE CASCADE,
 			CONSTRAINT `fk_character_auction_history_account` FOREIGN KEY (`account_id`) REFERENCES `accounts` (`id`) ON DELETE SET NULL,
 			CONSTRAINT `fk_character_auction_history_player` FOREIGN KEY (`player_id`) REFERENCES `players` (`id`) ON DELETE SET NULL
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;]],
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4]],
+		[[CREATE TABLE IF NOT EXISTS `player_bestiary_kills` (
+			`player_id` INT NOT NULL,
+			`raceid` SMALLINT UNSIGNED NOT NULL,
+			`kills` INT UNSIGNED NOT NULL DEFAULT 0,
+			PRIMARY KEY (`player_id`, `raceid`),
+			CONSTRAINT `fk_player_bestiary_kills_player`
+				FOREIGN KEY (`player_id`) REFERENCES `players` (`id`) ON DELETE CASCADE
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4]],
 	}
 
 	for _, query in ipairs(queries) do
 		if not db.query(query) then
-			logMigration("Failed to create Character Bazaar tables")
+			logMigration("Failed to repair required Character Bazaar/Bestiary tables")
 			return false
 		end
+	end
+
+	local indexResult = db.storeQuery(
+		"SELECT COUNT(*) AS `count` FROM `information_schema`.`STATISTICS`"
+		.. " WHERE `TABLE_SCHEMA` = DATABASE() AND `TABLE_NAME` = 'player_deaths'"
+		.. " AND `INDEX_NAME` = 'idx_player_deaths_unjustified_kills'"
+	)
+	local hasIndex = indexResult and result.getNumber(indexResult, "count") > 0
+	if indexResult then
+		result.free(indexResult)
+	end
+	if not hasIndex and not db.query(
+		"ALTER TABLE `player_deaths` ADD INDEX `idx_player_deaths_unjustified_kills`"
+		.. " (`killed_by`(64), `is_player`, `unjustified`, `time`)"
+	) then
+		logMigration("Failed to add idx_player_deaths_unjustified_kills")
+		return false
 	end
 
 	return true

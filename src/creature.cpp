@@ -9,6 +9,7 @@
 #include "events.h"
 #include "game.h"
 #include "monster.h"
+#include "performance_metrics.h"
 #include "scheduler.h"
 #include "scriptmanager.h"
 #include "instance_utils.h"
@@ -195,6 +196,7 @@ void Creature::onThink(uint32_t interval)
 
 void Creature::onAttacking(uint32_t interval)
 {
+	PerformanceScope performanceScope(PerformanceMetric::CreatureOnAttacking);
 	// OPTIMIZATION: Removed redundant isDead/isRemoved checks.
 	// checkCreatures() already validates creature state before calling this.
 
@@ -954,6 +956,7 @@ void Creature::getPathSearchParams(const Creature*, FindPathParams& fpp) const
 
 void Creature::goToFollowCreature()
 {
+	PerformanceScope performanceScope(PerformanceMetric::CreatureGoToFollow);
 	if (auto fc = followCreature.lock()) {
 		FindPathParams fpp;
 		getPathSearchParams(fc.get(), fpp);

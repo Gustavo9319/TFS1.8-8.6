@@ -238,7 +238,12 @@ public:
 	 */
 
 	void setBasicTile(uint16_t x, uint16_t y, uint8_t z, const BasicTile* basicTile);
+	void setBasicTile(uint16_t x, uint16_t y, uint8_t z, const std::shared_ptr<BasicTile>& basicTile);
 	void setBasicTile(const Position& pos, const BasicTile* basicTile)
+	{
+		setBasicTile(pos.x, pos.y, pos.z, basicTile);
+	}
+	void setBasicTile(const Position& pos, const std::shared_ptr<BasicTile>& basicTile)
 	{
 		setBasicTile(pos.x, pos.y, pos.z, basicTile);
 	}

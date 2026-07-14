@@ -12,6 +12,7 @@
 #include "luascript.h"
 #include "const.h"
 #include "map.h"
+#include "monster.h"
 #include "mounts.h"
 #include "player.h"
 #include "scriptmanager.h"
@@ -479,6 +480,24 @@ int luaPlayerSendCharmActivated(lua_State* L)
 	} else {
 		lua_pushnil(L);
 	}
+	return 1;
+}
+
+int luaPlayerUpdateKillTracker(lua_State* L)
+{
+	// player:updateKillTracker(monster, corpse)
+	const auto player = getLuaPlayerShared(L, 1);
+	Monster* monsterRaw = getUserdata<Monster>(L, 2);
+	Container* corpseRaw = getUserdata<Container>(L, 3);
+	const auto monster = monsterRaw ? std::dynamic_pointer_cast<Monster>(monsterRaw->weak_from_this().lock()) : nullptr;
+	const auto corpse = corpseRaw ? std::dynamic_pointer_cast<Container>(corpseRaw->weak_from_this().lock()) : nullptr;
+	if (!player || !monster || !corpse) {
+		lua_pushnil(L);
+		return 1;
+	}
+
+	player->updateKillTracker(monster, corpse);
+	pushBoolean(L, true);
 	return 1;
 }
 
@@ -1514,6 +1533,32 @@ int luaPlayerSetBankBalance(lua_State* L)
 	return 1;
 }
 
+int luaPlayerGetPreyWildcards(lua_State* L)
+{
+	// player:getPreyWildcards()
+	const Player* player = getUserdata<const Player>(L, 1);
+	if (player) {
+		lua_pushinteger(L, player->getPreyWildcards());
+	} else {
+		lua_pushnil(L);
+	}
+	return 1;
+}
+
+int luaPlayerSetPreyWildcards(lua_State* L)
+{
+	// player:setPreyWildcards(value)
+	Player* player = getUserdata<Player>(L, 1);
+	if (!player) {
+		lua_pushnil(L);
+		return 1;
+	}
+
+	player->setPreyWildcards(getInteger<uint64_t>(L, 2));
+	pushBoolean(L, true);
+	return 1;
+}
+
 // Task Hunting Points
 int luaPlayerGetTaskHuntingPoints(lua_State* L)
 {
@@ -2076,6 +2121,20 @@ int luaPlayerSendSkills(lua_State* L)
 	}
 
 	player->sendSkills();
+	pushBoolean(L, true);
+	return 1;
+}
+
+int luaPlayerSendItemValues(lua_State* L)
+{
+	// player:sendItemValues()
+	const Player* player = getUserdata<const Player>(L, 1);
+	if (!player) {
+		lua_pushnil(L);
+		return 1;
+	}
+
+	player->sendItemValues();
 	pushBoolean(L, true);
 	return 1;
 }
@@ -4577,6 +4636,7 @@ void LuaScriptInterface::registerPlayer()
 	registerMethod("Player", "getDropBonus", luaPlayerGetDropBonus);
 	registerMethod("Player", "setTemporaryDeathLossReduction", luaPlayerSetTemporaryDeathLossReduction);
 	registerMethod("Player", "sendCharmActivated", luaPlayerSendCharmActivated);
+	registerMethod("Player", "updateKillTracker", luaPlayerUpdateKillTracker);
 	registerMethod("Player", "addConditionSuppressions", luaPlayerAddConditionSuppressions);
 	registerMethod("Player", "removeConditionSuppressions", luaPlayerRemoveConditionSuppressions);
 
@@ -4662,6 +4722,8 @@ void LuaScriptInterface::registerPlayer()
 
 	registerMethod("Player", "getBankBalance", luaPlayerGetBankBalance);
 	registerMethod("Player", "setBankBalance", luaPlayerSetBankBalance);
+	registerMethod("Player", "getPreyWildcards", luaPlayerGetPreyWildcards);
+	registerMethod("Player", "setPreyWildcards", luaPlayerSetPreyWildcards);
 
 	registerMethod("Player", "getTaskHuntingPoints", luaPlayerGetTaskHuntingPoints);
 	registerMethod("Player", "setTaskHuntingPoints", luaPlayerSetTaskHuntingPoints);
@@ -4694,6 +4756,7 @@ void LuaScriptInterface::registerPlayer()
 	registerMethod("Player", "sendTextMessage", luaPlayerSendTextMessage);
 	registerMethod("Player", "sendStats", luaPlayerSendStats);
 	registerMethod("Player", "sendSkills", luaPlayerSendSkills);
+	registerMethod("Player", "sendItemValues", luaPlayerSendItemValues);
 	registerMethod("Player", "sendChannelMessage", luaPlayerSendChannelMessage);
 	registerMethod("Player", "sendPrivateMessage", luaPlayerSendPrivateMessage);
 	registerMethod("Player", "channelSay", luaPlayerChannelSay);

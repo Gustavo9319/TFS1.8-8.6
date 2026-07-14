@@ -23,6 +23,7 @@
 #include "monster.h"
 #include "movement.h"
 #include "outputmessage.h"
+#include "performance_metrics.h"
 #include "pugicast.h"
 #include "decay.h"
 #include "scheduler.h"
@@ -1628,6 +1629,7 @@ void Game::playerMoveCreature(Player* player, Creature* movingCreature, const Po
 
 ReturnValue Game::internalMoveCreature(Creature* creature, Direction direction, uint32_t flags /*= 0*/)
 {
+	PerformanceScope performanceScope(PerformanceMetric::GameInternalMoveCreature);
 	creature->setLastPosition(creature->getPosition());
 	const Position& currentPos = creature->getPosition();
 	Position destPos = getNextPosition(direction, currentPos);
@@ -5888,6 +5890,7 @@ bool Game::internalCreatureSay(Creature* creature, SpeakClasses type, std::strin
 
 void Game::checkCreatureWalk(uint32_t creatureId)
 {
+	PerformanceScope performanceScope(PerformanceMetric::GameCheckCreatureWalk);
 	auto creatureRef = getCreatureByIDShared(creatureId);
 	Creature* creature = creatureRef.get();
 	if (creature && !creature->isRemoved() && !creature->isDead()) {
@@ -5897,6 +5900,7 @@ void Game::checkCreatureWalk(uint32_t creatureId)
 
 void Game::updateCreatureWalk(uint32_t creatureId)
 {
+	PerformanceScope performanceScope(PerformanceMetric::GameUpdateCreatureWalk);
 	auto creatureRef = getCreatureByIDShared(creatureId);
 	Creature* creature = creatureRef.get();
 	if (creature && !creature->isRemoved() && !creature->isDead()) {
@@ -5960,6 +5964,7 @@ void Game::removeCreatureCheck(Creature* creature)
 
 void Game::checkCreatures(size_t index)
 {
+	PerformanceScope performanceScope(PerformanceMetric::GameCheckCreatures);
 	auto& checkCreatureList = checkCreatureLists[index];
 	size_t i = 0;
 
@@ -6552,6 +6557,10 @@ bool Game::combatChangeHealth(Creature* attacker, Creature* target, CombatDamage
 						}
 					}
 				}
+
+				if (auto targetPlayerRef = std::dynamic_pointer_cast<Player>(targetRef)) {
+					targetPlayerRef->updateImpactTracker(0, static_cast<uint32_t>(realHeal), COMBAT_HEALING);
+				}
 			}
 		}
 
@@ -6831,6 +6840,28 @@ bool Game::combatChangeHealth(Creature* attacker, Creature* target, CombatDamage
 		realDamage = damage.primary.value + damage.secondary.value;
 		if (realDamage == 0) {
 			return true;
+		}
+
+		const auto attackerPlayerRef = std::dynamic_pointer_cast<Player>(attackerRef);
+		const auto targetPlayerRef = std::dynamic_pointer_cast<Player>(targetRef);
+		if (attackerPlayerRef) {
+			if (damage.primary.value > 0) {
+				attackerPlayerRef->updateImpactTracker(1, static_cast<uint32_t>(damage.primary.value), damage.primary.type);
+			}
+			if (damage.secondary.value > 0) {
+				attackerPlayerRef->updateImpactTracker(1, static_cast<uint32_t>(damage.secondary.value), damage.secondary.type);
+			}
+		}
+		if (targetPlayerRef) {
+			const std::string_view attackerName = attacker ? std::string_view(attacker->getName()) : std::string_view{};
+			if (damage.primary.value > 0) {
+				targetPlayerRef->updateImpactTracker(2, static_cast<uint32_t>(damage.primary.value), damage.primary.type,
+				                                     attackerName);
+			}
+			if (damage.secondary.value > 0) {
+				targetPlayerRef->updateImpactTracker(2, static_cast<uint32_t>(damage.secondary.value), damage.secondary.type,
+				                                     attackerName);
+			}
 		}
 
 		if (spectators.empty()) {

@@ -4,8 +4,6 @@
 #ifndef FS_SPECTATORS_H
 #define FS_SPECTATORS_H
 
-#include <absl/container/flat_hash_set.h>
-
 #include <algorithm>
 #include <cassert>
 #include <functional>
@@ -27,17 +25,21 @@ public:
 
 	void addSpectators(const SpectatorVec& spectators)
 	{
-		absl::flat_hash_set<Creature*> existing;
-		existing.reserve(vec.size() + spectators.vec.size());
-		for (const auto& spectator : vec) {
-			existing.insert(spectator.get());
+		if (spectators.vec.empty() || &spectators == this) {
+			return;
 		}
 
-		for (const auto& spectator : spectators.vec) {
-			if (existing.insert(spectator.get()).second) {
-				vec.emplace_back(spectator);
-			}
-		}
+		vec.reserve(vec.size() + spectators.vec.size());
+		vec.insert(vec.end(), spectators.vec.begin(), spectators.vec.end());
+
+		vec.erase(std::remove_if(vec.begin(), vec.end(),
+			[](const auto& spectator) { return !spectator; }), vec.end());
+
+		// shared_ptr's default comparisons are .get()-based under a strict total
+		// order (C++20 [util.smartptr.shared.cmp]), so no custom comparators needed.
+		std::sort(vec.begin(), vec.end());
+		vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
+
 		partitioned_ = false;
 	}
 

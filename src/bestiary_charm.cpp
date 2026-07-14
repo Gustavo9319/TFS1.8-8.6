@@ -201,6 +201,10 @@ void BestiaryCharmSystem::invalidatePlayer(uint32_t playerGuid) const
 
 uint32_t BestiaryCharmSystem::getKillCount(uint32_t playerGuid, uint16_t raceId) const
 {
+	if (const auto player = g_game.getPlayerByGUID(playerGuid)) {
+		return player->getBestiaryKillCount(raceId);
+	}
+
 	auto result = Database::getInstance().storeQuery(fmt::format(
 	    "SELECT `kills` FROM `player_bestiary_kills` WHERE `player_id` = {:d} AND `raceid` = {:d}",
 	    playerGuid, raceId));
@@ -209,6 +213,10 @@ uint32_t BestiaryCharmSystem::getKillCount(uint32_t playerGuid, uint16_t raceId)
 
 uint32_t BestiaryCharmSystem::getCharmPoints(uint32_t playerGuid) const
 {
+	if (const auto player = g_game.getPlayerByGUID(playerGuid)) {
+		return player->getBestiaryCharmPoints();
+	}
+
 	auto result = Database::getInstance().storeQuery(
 	    fmt::format("SELECT `charmpoints` FROM `players` WHERE `id` = {:d}", playerGuid));
 	return result ? result->getNumber<uint32_t>("charmpoints") : 0;
@@ -216,6 +224,11 @@ uint32_t BestiaryCharmSystem::getCharmPoints(uint32_t playerGuid) const
 
 bool BestiaryCharmSystem::setCharmPoints(uint32_t playerGuid, uint32_t points) const
 {
+	if (const auto player = g_game.getPlayerByGUID(playerGuid)) {
+		player->setBestiaryCharmPoints(points);
+		return true;
+	}
+
 	return Database::getInstance().executeQuery(
 	    fmt::format("UPDATE `players` SET `charmpoints` = {:d} WHERE `id` = {:d}", points, playerGuid));
 }
@@ -331,11 +344,11 @@ bool BestiaryCharmSystem::restoreCharmStatesAndResources(uint32_t playerGuid, co
                                                          uint32_t charmPoints, uint32_t minorEchoes,
                                                          uint32_t maxMinorEchoes) const
 {
-	return DBTransaction::executeWithinTransactionRollbackOnFailure([&]() {
+	const bool restored = DBTransaction::executeWithinTransactionRollbackOnFailure([&]() {
 		return writeCharmStates(playerGuid, states) &&
-		       setCharmPoints(playerGuid, charmPoints) &&
 		       setMinorCharmEchoes(playerGuid, minorEchoes, maxMinorEchoes);
 	});
+	return restored && setCharmPoints(playerGuid, charmPoints);
 }
 
 BestiaryCharmActionResult BestiaryCharmSystem::handleCharmAction(Player& player, uint8_t charmId, uint8_t action, uint16_t raceId) const
@@ -376,9 +389,11 @@ BestiaryCharmActionResult BestiaryCharmSystem::handleCharmAction(Player& player,
 				           "INSERT INTO `player_bestiary_charms` (`player_id`, `charm_id`, `unlocked`, `raceid`) "
 				           "VALUES ({:d}, {:d}, {:d}, 0) ON DUPLICATE KEY UPDATE `unlocked` = {:d}",
 				           playerGuid, charmId, nextTier, nextTier)) &&
-				       setCharmPoints(playerGuid, charmPoints - price) &&
 				       setMinorCharmEchoes(playerGuid, minorEchoes + echoReward, maxMinorEchoes + echoReward);
 			});
+			if (updated) {
+				player.setBestiaryCharmPoints(charmPoints - price);
+			}
 		} else {
 			const auto [minorEchoes, maxMinorEchoes] = getMinorCharmEchoes(playerGuid);
 			if (minorEchoes < price) {
@@ -415,12 +430,12 @@ BestiaryCharmActionResult BestiaryCharmSystem::handleCharmAction(Player& player,
 			return Database::getInstance().executeQuery(fmt::format(
 			           "UPDATE `player_bestiary_charms` SET `unlocked` = 0, `raceid` = 0 WHERE `player_id` = {:d}",
 			           playerGuid)) &&
-			       setCharmPoints(playerGuid, charmPoints + refund) &&
 			       setMinorCharmEchoes(playerGuid, 0, 0);
 		});
 		if (!reset) {
 			return { false, "Could not reset charms." };
 		}
+		player.setBestiaryCharmPoints(charmPoints + refund);
 		if (!removeGold(player, resetCost)) {
 			const bool restored = restoreCharmStatesAndResources(playerGuid, states, charmPoints, minorEchoes, maxMinorEchoes);
 			invalidatePlayer(playerGuid);

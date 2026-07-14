@@ -13,6 +13,7 @@
 #include "iomapserialize.h"
 #include "mapcache.h"
 #include "monster.h"
+#include "performance_metrics.h"
 #include "spectators.h"
 #include "logger.h"
 #include "zones.h"
@@ -309,6 +310,7 @@ bool Map::placeCreature(const Position& centerPos, Creature* creature, bool exte
 
 void Map::moveCreature(Creature& creature, Tile& newTile, bool forceTeleport /* = false*/)
 {
+	PerformanceScope performanceScope(PerformanceMetric::MapMoveCreature);
 	Tile& oldTile = *creature.getTile();
 
 	// If the tile does not have the creature it means that the creature is ready for elimination, we skip the move.
@@ -468,6 +470,7 @@ void Map::getSpectators(SpectatorVec& spectators, const Position& centerPos, boo
                         bool onlyPlayers /*= false*/, int32_t minRangeX /*= 0*/, int32_t maxRangeX /*= 0*/,
                         int32_t minRangeY /*= 0*/, int32_t maxRangeY /*= 0*/, bool onlyMonsters /*= false*/, bool onlyNpcs /*= false*/)
 {
+	PerformanceScope performanceScope(PerformanceMetric::MapGetSpectators);
 	if (centerPos.z >= MAP_MAX_LAYERS) {
 		return;
 	}
@@ -777,11 +780,24 @@ struct AStarWorkspace
 };
 
 thread_local AStarWorkspace threaded_workspace;
+
+struct PathSearchMetrics
+{
+	uint32_t nodesVisited = 0;
+	uint32_t tilesRead = 0;
+};
 } // namespace
 
 bool Map::getPathMatching(const Creature& creature, std::vector<Direction>& dirList,
                           const FrozenPathingConditionCall& pathCondition, const FindPathParams& fpp) const
 {
+	PerformanceScope performanceScope(PerformanceMetric::MapGetPathMatching);
+	PathSearchMetrics searchMetrics;
+	const auto finish = [&](bool success) {
+		g_performanceMetrics.recordPathRequest(success, searchMetrics.nodesVisited, searchMetrics.tilesRead,
+		                                       success ? dirList.size() : 0);
+		return success;
+	};
 	Position end_position;
 	auto position = creature.getPosition();
 	auto nodes = AStarNodes(position.x, position.y);
@@ -812,8 +828,9 @@ bool Map::getPathMatching(const Creature& creature, std::vector<Direction>& dirL
 			if (found != ASTAR_NODE_NONE) {
 				break;
 			}
-			return false;
+			return finish(false);
 		}
+		++searchMetrics.nodesVisited;
 
 		const AStarNode& node = nodes.GetNode(nodeIdx);
 		const int_fast32_t x = node.x;
@@ -875,6 +892,7 @@ bool Map::getPathMatching(const Creature& creature, std::vector<Direction>& dirL
 
 			const uint16_t neighborNodeIdx = nodes.GetNodeByPosition(position.x, position.y);
 			const bool hasNeighborNode = neighborNodeIdx != ASTAR_NODE_NONE;
+			++searchMetrics.tilesRead;
 			const Tile *tile = hasNeighborNode ? getTile(position.x, position.y, position.z)
 				: canWalkTo(creature, position);
 
@@ -907,7 +925,7 @@ bool Map::getPathMatching(const Creature& creature, std::vector<Direction>& dirL
 					if (found != ASTAR_NODE_NONE) {
 						break;
 					}
-					return false;
+					return finish(false);
 				}
 			}
 		}
@@ -916,7 +934,7 @@ bool Map::getPathMatching(const Creature& creature, std::vector<Direction>& dirL
 	}
 
 	if (found == ASTAR_NODE_NONE) {
-		return false;
+		return finish(false);
 	}
 
 	int_fast32_t prevx = end_position.x;
@@ -954,7 +972,7 @@ bool Map::getPathMatching(const Creature& creature, std::vector<Direction>& dirL
 
 		found = node.parent;
 	}
-	return true;
+	return finish(true);
 }
 
 // AStarNodes
@@ -1374,6 +1392,20 @@ void Map::setBasicTile(uint16_t x, uint16_t y, uint8_t z, const BasicTile* basic
 	} else {
 		Zones::unregisterPosition(Position(x, y, z));
 	}
+}
+
+void Map::setBasicTile(uint16_t x, uint16_t y, uint8_t z, const std::shared_ptr<BasicTile>& basicTile)
+{
+	if (!basicTile) {
+		setBasicTile(x, y, z, static_cast<const BasicTile*>(nullptr));
+		return;
+	}
+
+	BasicTile cacheCandidate = *basicTile;
+	cacheCandidate.cacheId = 0;
+	cacheCandidate.cachedHash = 0;
+	cacheCandidate.hashReady = false;
+	setBasicTile(x, y, z, MapCache::tryGetTileFromCache(std::move(cacheCandidate)));
 }
 
 void Map::forEachBasicFloorBlock(

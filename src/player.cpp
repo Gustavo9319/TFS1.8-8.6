@@ -785,6 +785,40 @@ void Player::sendMonkData()
 	client->sendExtendedOpcode(0x92, json);
 }
 
+void Player::updateKillTracker(const std::shared_ptr<Monster>& monster, const std::shared_ptr<Container>& corpse) const
+{
+	if (!client || !monster || !corpse) {
+		return;
+	}
+
+	if (const auto protocol = client->protocol()) {
+		protocol->sendKillTrackerUpdate(corpse, monster->getName(), monster->getCurrentOutfit());
+	}
+}
+
+void Player::updateImpactTracker(uint8_t analyzerType, uint32_t amount, CombatType_t combatType,
+                                 std::string_view targetName) const
+{
+	if (!client || amount == 0) {
+		return;
+	}
+
+	if (const auto protocol = client->protocol()) {
+		protocol->sendImpactTracker(analyzerType, amount, combatType, targetName);
+	}
+}
+
+void Player::sendItemValues() const
+{
+	if (!client) {
+		return;
+	}
+
+	if (const auto protocol = client->protocol()) {
+		protocol->sendItemValues();
+	}
+}
+
 void Player::addBlessing(uint8_t blessing, uint8_t count)
 {
 	if (blessing < 1 || blessing > PLAYER_MAX_BLESSINGS || blessings[blessing] == 255) return;
@@ -1592,6 +1626,86 @@ uint16_t Player::getLookCorpse() const
 		return ITEM_FEMALE_CORPSE;
 	}
 	return ITEM_MALE_CORPSE;
+}
+
+void Player::setBestiaryKillCount(uint16_t raceId, uint32_t count)
+{
+	if (raceId == 0) {
+		return;
+	}
+	const auto it = bestiaryKills.find(raceId);
+	if (it != bestiaryKills.end() && it->second == count) {
+		return;
+	}
+	bestiaryKills[raceId] = count;
+	modifiedBestiaryRaceIds.insert(raceId);
+	bestiaryDirtyRaceRevisions[raceId] = ++bestiaryDirtyRevision;
+}
+
+std::pair<uint32_t, uint32_t> Player::addBestiaryKillCount(uint16_t raceId, uint32_t amount)
+{
+	const uint32_t oldCount = getBestiaryKillCount(raceId);
+	if (raceId == 0 || amount == 0) {
+		return {oldCount, oldCount};
+	}
+
+	const uint32_t newCount = amount > std::numeric_limits<uint32_t>::max() - oldCount ?
+	                              std::numeric_limits<uint32_t>::max() :
+	                              oldCount + amount;
+	setBestiaryKillCount(raceId, newCount);
+	return {oldCount, newCount};
+}
+
+uint32_t Player::getBestiaryKillCount(uint16_t raceId) const
+{
+	const auto it = bestiaryKills.find(raceId);
+	return it != bestiaryKills.end() ? it->second : 0;
+}
+
+std::pair<uint32_t, uint32_t> Player::addBestiaryCharmPoints(uint32_t amount)
+{
+	const uint32_t oldPoints = bestiaryCharmPoints;
+	const uint32_t newPoints = amount > std::numeric_limits<uint32_t>::max() - oldPoints ?
+	                               std::numeric_limits<uint32_t>::max() :
+	                               oldPoints + amount;
+	bestiaryCharmPoints = newPoints;
+	return {oldPoints, newPoints};
+}
+
+std::pair<uint32_t, uint32_t> Player::addBosstiaryPoints(uint32_t amount)
+{
+	const uint32_t oldPoints = bosstiaryPoints;
+	const uint32_t newPoints = amount > std::numeric_limits<uint32_t>::max() - oldPoints ?
+	                               std::numeric_limits<uint32_t>::max() :
+	                               oldPoints + amount;
+	bosstiaryPoints = newPoints;
+	return {oldPoints, newPoints};
+}
+
+Player::BestiaryDirtySnapshot Player::getBestiaryDirtySnapshot() const
+{
+	return BestiaryDirtySnapshot{bestiaryDirtyRevision, modifiedBestiaryRaceIds};
+}
+
+void Player::acknowledgeBestiaryDirty(const BestiaryDirtySnapshot& snapshot)
+{
+	for (const uint16_t raceId : snapshot.modifiedRaceIds) {
+		const auto revisionIt = bestiaryDirtyRaceRevisions.find(raceId);
+		if (revisionIt != bestiaryDirtyRaceRevisions.end() && revisionIt->second > snapshot.snapshotId) {
+			continue;
+		}
+
+		modifiedBestiaryRaceIds.erase(raceId);
+		if (revisionIt != bestiaryDirtyRaceRevisions.end()) {
+			bestiaryDirtyRaceRevisions.erase(revisionIt);
+		}
+	}
+}
+
+void Player::clearBestiaryDirty()
+{
+	modifiedBestiaryRaceIds.clear();
+	bestiaryDirtyRaceRevisions.clear();
 }
 
 void Player::setStorageValue(const uint32_t key, const std::optional<int64_t> value, const bool isSpawn /* = false*/)
@@ -3428,6 +3542,27 @@ void Player::death(Creature* lastHitCreature)
 {
 	loginPosition = town->getTemplePosition();
 	setInstanceID(0);
+
+	// Summons vanish when their master dies (same as on logout/removal);
+	// otherwise they would stay bonded forever, never go idle and keep
+	// wandering around looking for a master that respawned at the temple.
+	std::vector<std::shared_ptr<Creature>> summonRefs;
+	summonRefs.reserve(summons.size());
+	for (const auto& summonRef : summons) {
+		if (auto summon = summonRef.lock()) {
+			summonRefs.push_back(std::move(summon));
+		}
+	}
+	summons.clear();
+
+	for (const auto& summon : summonRefs) {
+		summon->setSkillLoss(false);
+		if (summon->getMaster().get() == this) {
+			summon->removeMaster();
+		}
+		g_game.removeCreature(summon.get(), false);
+		g_game.addMagicEffect(summon->getPosition(), CONST_ME_POFF, summon->getInstanceID());
+	}
 
 	auto refreshDeathPingWindow = [this]() {
 		const int64_t timeNow = OTSYS_TIME();

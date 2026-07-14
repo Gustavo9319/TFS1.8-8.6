@@ -11,6 +11,7 @@
 #include "iologindata.h"
 #include "logger.h"
 #include "player.h"
+#include "performance_metrics.h"
 #include "scriptmanager.h"
 #include "spells.h"
 
@@ -840,12 +841,11 @@ bool Monster::isOpponent(const Creature* creature) const
 		       (!targetPlayer || (targetPlayer != masterPlayer && !masterPlayer->isPartner(targetPlayer)));
 	}
 
+	// A player-owned summon is always a valid opponent, even when its master
+	// has PlayerFlag_IgnoredByMonsters (e.g. GM/ADM) — only the flagged player
+	// himself is ignored (checked above), matching upstream TFS behavior.
 	auto creatureMaster = creature->getMaster();
 	const Player* creatureMasterPlayer = creatureMaster ? creatureMaster->getPlayer() : nullptr;
-	if (creatureMasterPlayer && creatureMasterPlayer->hasFlag(PlayerFlag_IgnoredByMonsters)) {
-		return false;
-	}
-
 	if (player || creatureMasterPlayer) {
 		return true;
 	}
@@ -1357,6 +1357,7 @@ void Monster::onEndCondition(ConditionType_t type)
 
 void Monster::onThink(uint32_t interval)
 {
+	PerformanceScope performanceScope(PerformanceMetric::MonsterOnThink);
 	Creature::onThink(interval);
 
 	if (mType->info.thinkEvent != -1) {
@@ -1402,6 +1403,14 @@ void Monster::onThink(uint32_t interval)
 
 			if (isSummon()) {
 				auto master = getMaster();
+				if (master && (master->isRemoved() || master->isDead())) {
+					// The master is gone from the game world but the bond was
+					// not severed (safety net) — vanish instead of wandering
+					// around forever searching for him.
+					g_game.addMagicEffect(getPosition(), CONST_ME_POFF, getInstanceID());
+					g_game.removeCreature(this, false);
+					return;
+				}
 				if (master) {
 					const Tile* masterTile = master->getTile();
 					const bool masterInProtectionZone = masterTile && masterTile->hasFlag(TILESTATE_PROTECTIONZONE);
@@ -1421,8 +1430,8 @@ void Monster::onThink(uint32_t interval)
 						}
 					} else if (masterInProtectionZone) {
 						if (ConfigManager::getBoolean(ConfigManager::REMOVE_SUMMONS_ON_PZ)) {
-							g_game.removeCreature(this, false);
 							g_game.addMagicEffect(getPosition(), CONST_ME_POFF, getInstanceID());
+							g_game.removeCreature(this, false);
 							return;
 						}
 					} else if (ConfigManager::getBoolean(ConfigManager::TELEPORT_SUMMON)) {
@@ -1482,6 +1491,7 @@ void Monster::onThink(uint32_t interval)
 
 void Monster::doAttacking(uint32_t interval)
 {
+	PerformanceScope performanceScope(PerformanceMetric::MonsterDoAttacking);
 	if (isRemoved() || isDead()) {
 		return;
 	}
@@ -1859,7 +1869,11 @@ bool Monster::walkToSpawn()
 	return true;
 }
 
-void Monster::onWalk() { Creature::onWalk(); }
+void Monster::onWalk()
+{
+	PerformanceScope performanceScope(PerformanceMetric::MonsterOnWalk);
+	Creature::onWalk();
+}
 
 void Monster::onWalkComplete()
 {
@@ -1991,7 +2005,10 @@ bool Monster::getNextStep(Direction& direction, uint32_t& flags)
 	}
 
 	bool result = false;
-	if (!walkingToSpawn && (followCreature.expired() || !hasFollowPath) && (!isSummon() || !isMasterInRange)) {
+	if (!walkingToSpawn && (followCreature.expired() || !hasFollowPath) && !isSummon()) {
+		// Free monsters wander randomly. A summon that lost sight of its
+		// master (stairs, holes) stands still and waits instead — it resumes
+		// following once the master is back in range (isMasterInRange).
 		if (getTimeSinceLastMove() >= EVENT_CREATURE_THINK_INTERVAL) {
 			randomStepping = true;
 			// choose a random direction
