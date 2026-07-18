@@ -531,14 +531,14 @@ void ProtocolLogin::onRecvFirstMessage(NetworkMessage& msg)
 
 	// When astraClientOnly is true, reject any client that is not AstraClient.
 	if (getBoolean(ConfigManager::ASTRA_CLIENT_ONLY) && !isAstraClient_) {
-		LOG_INFO("[AstraClient] Client rejected: AstraClient required");
+		LOG_WARN("[AstraClient] Client rejected: AstraClient required");
 		disconnectClient(AstraClient::REQUIRED_MESSAGE);
 		return;
 	}
 
 	// When fonticakClientOnly is true, reject any client that is not FonticakClient.
 	if (getBoolean(ConfigManager::FONTICAK_CLIENT_ONLY) && !isFonticakClient_) {
-		LOG_INFO("[FonticakClient] Client rejected: OTC-Fonticak required");
+		LOG_WARN("[FonticakClient] Client rejected: OTC-Fonticak required");
 		disconnectClient(FonticakClient::REQUIRED_MESSAGE);
 		return;
 	}
@@ -546,10 +546,10 @@ void ProtocolLogin::onRecvFirstMessage(NetworkMessage& msg)
 	const bool isAstraCastListRequest =
 	    accountName.empty() && isAstraClient_ && password == ASTRA_LOGIN_CAST_LIST_REQUEST;
 	if (isAstraClient_ && !isAstraCastListRequest) {
-		LOG_INFO(">> [AstraClient] Client accepted");
+		LOG_DEBUG("[AstraClient] Login protocol client accepted");
 	}
 	if (isFonticakClient_) {
-		LOG_INFO(">> [FonticakClient] Client accepted");
+		LOG_DEBUG("[FonticakClient] Login protocol client accepted");
 	}
 
 	// Brute force check before dispatching login task

@@ -1,12 +1,11 @@
 function onUpdateDatabase()
-	logMigration("Updating database to version 61 (move Supply Stash persistence to C++)")
+	logMigration("Updating database to version 61 (move Market persistence to C++)")
 
-	local function columnExists(columnName)
-		local queryResult = db.storeQuery(
-			"SELECT COUNT(*) AS `count` FROM `information_schema`.`COLUMNS`" ..
-			" WHERE `TABLE_SCHEMA` = DATABASE() AND `TABLE_NAME` = 'player_supplystash'" ..
-			" AND `COLUMN_NAME` = '" .. columnName .. "'"
-		)
+	local function columnExists(tableName, columnName)
+		local query = "SELECT COUNT(*) AS `count` FROM `information_schema`.`COLUMNS`"
+			.. " WHERE `TABLE_SCHEMA` = DATABASE() AND `TABLE_NAME` = '" .. tableName .. "'"
+			.. " AND `COLUMN_NAME` = '" .. columnName .. "'"
+		local queryResult = db.storeQuery(query)
 		local exists = queryResult and result.getNumber(queryResult, "count") > 0
 		if queryResult then
 			result.free(queryResult)
@@ -14,13 +13,12 @@ function onUpdateDatabase()
 		return exists
 	end
 
-	local function primaryKeySignature()
+	local function indexSignature(tableName, indexName)
 		local columns = {}
-		local queryResult = db.storeQuery(
-			"SELECT `COLUMN_NAME` FROM `information_schema`.`STATISTICS`" ..
-			" WHERE `TABLE_SCHEMA` = DATABASE() AND `TABLE_NAME` = 'player_supplystash'" ..
-			" AND `INDEX_NAME` = 'PRIMARY' ORDER BY `SEQ_IN_INDEX`"
-		)
+		local query = "SELECT `COLUMN_NAME` FROM `information_schema`.`STATISTICS`"
+			.. " WHERE `TABLE_SCHEMA` = DATABASE() AND `TABLE_NAME` = '" .. tableName .. "'"
+			.. " AND `INDEX_NAME` = '" .. indexName .. "' ORDER BY `SEQ_IN_INDEX`"
+		local queryResult = db.storeQuery(query)
 		if queryResult then
 			repeat
 				columns[#columns + 1] = result.getString(queryResult, "COLUMN_NAME")
@@ -30,92 +28,80 @@ function onUpdateDatabase()
 		return table.concat(columns, ",")
 	end
 
-	-- Returns "cascade" when the FK exists with ON DELETE CASCADE,
-	-- "wrong_rule" and the constraint name when it exists with a different rule,
-	-- or false when no matching FK exists.
-	local function checkPlayerForeignKey()
-		local queryResult = db.storeQuery([[
-			SELECT `rc`.`CONSTRAINT_NAME`, `rc`.`DELETE_RULE`
-			FROM `information_schema`.`KEY_COLUMN_USAGE` AS `kcu`
-			JOIN `information_schema`.`REFERENTIAL_CONSTRAINTS` AS `rc`
-			  ON `rc`.`CONSTRAINT_SCHEMA` = `kcu`.`CONSTRAINT_SCHEMA`
-			  AND `rc`.`CONSTRAINT_NAME` = `kcu`.`CONSTRAINT_NAME`
-			WHERE `kcu`.`CONSTRAINT_SCHEMA` = DATABASE()
-			  AND `kcu`.`TABLE_NAME` = 'player_supplystash'
-			  AND `kcu`.`COLUMN_NAME` = 'player_id'
-			  AND `kcu`.`REFERENCED_TABLE_NAME` = 'players'
-			  AND `kcu`.`REFERENCED_COLUMN_NAME` = 'id'
-			LIMIT 1
-		]])
-		if not queryResult then
-			return false
-		end
-		local constraintName = result.getString(queryResult, "CONSTRAINT_NAME")
-		local deleteRule = result.getString(queryResult, "DELETE_RULE")
-		result.free(queryResult)
-		if deleteRule == "CASCADE" then
-			return "cascade"
-		end
-		return "wrong_rule", constraintName
+	local function ensureColumn(tableName, columnName, definition)
+		return columnExists(tableName, columnName)
+			or db.query("ALTER TABLE `" .. tableName .. "` ADD COLUMN `" .. columnName .. "` " .. definition)
 	end
 
-	if not db.query([[
-		CREATE TABLE IF NOT EXISTS `player_supplystash` (
-			`player_id` INT NOT NULL,
-			`itemtype` SMALLINT UNSIGNED NOT NULL,
-			`tier` TINYINT UNSIGNED NOT NULL DEFAULT 0,
-			`amount` INT UNSIGNED NOT NULL DEFAULT 0,
-			PRIMARY KEY (`player_id`, `itemtype`, `tier`),
-			CONSTRAINT `player_supplystash_player_fk`
-				FOREIGN KEY (`player_id`) REFERENCES `players` (`id`) ON DELETE CASCADE
-		) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8
-	]]) then
+	local function ensureIndex(tableName, indexName, columns, expectedSignature)
+		local currentSignature = indexSignature(tableName, indexName)
+		if currentSignature == expectedSignature then
+			return true
+		end
+
+		local dropIndex = currentSignature ~= "" and "DROP INDEX `" .. indexName .. "`, " or ""
+		return db.query(
+			"ALTER TABLE `" .. tableName .. "` " .. dropIndex ..
+			"ADD INDEX `" .. indexName .. "` (" .. columns .. ")"
+		) and indexSignature(tableName, indexName) == expectedSignature
+	end
+
+	if not db.query([[CREATE TABLE IF NOT EXISTS `market_offers` (
+		`id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+		`player_id` INT NOT NULL,
+		`sale` TINYINT NOT NULL DEFAULT 0,
+		`itemtype` SMALLINT UNSIGNED NOT NULL,
+		`amount` SMALLINT UNSIGNED NOT NULL,
+		`created` INT UNSIGNED NOT NULL,
+		`anonymous` TINYINT NOT NULL DEFAULT 0,
+		`price` INT UNSIGNED NOT NULL DEFAULT 0,
+		`tier` TINYINT UNSIGNED NOT NULL DEFAULT 0,
+		`attributes` MEDIUMBLOB NULL,
+		PRIMARY KEY (`id`),
+		KEY `idx_market_offers_item_sale_price` (`itemtype`, `sale`, `price`, `created`),
+		KEY `idx_market_offers_player_created` (`player_id`, `created`),
+		KEY `idx_market_offers_created` (`created`),
+		CONSTRAINT `fk_market_offers_player` FOREIGN KEY (`player_id`) REFERENCES `players` (`id`) ON DELETE CASCADE
+	) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8]]) then
 		return false
 	end
 
-	if not columnExists("tier") and not db.query(
-		"ALTER TABLE `player_supplystash` ADD COLUMN `tier` TINYINT UNSIGNED NOT NULL DEFAULT 0 AFTER `itemtype`"
-	) then
+	if not db.query([[CREATE TABLE IF NOT EXISTS `market_history` (
+		`id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+		`player_id` INT NOT NULL,
+		`sale` TINYINT NOT NULL DEFAULT 0,
+		`itemtype` SMALLINT UNSIGNED NOT NULL,
+		`amount` SMALLINT UNSIGNED NOT NULL,
+		`price` INT UNSIGNED NOT NULL DEFAULT 0,
+		`tier` TINYINT UNSIGNED NOT NULL DEFAULT 0,
+		`expires_at` BIGINT UNSIGNED NOT NULL,
+		`inserted` BIGINT UNSIGNED NOT NULL,
+		`state` TINYINT UNSIGNED NOT NULL,
+		PRIMARY KEY (`id`),
+		KEY `idx_market_history_player_inserted` (`player_id`, `inserted`),
+		CONSTRAINT `fk_market_history_player` FOREIGN KEY (`player_id`) REFERENCES `players` (`id`) ON DELETE CASCADE
+	) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8]]) then
 		return false
 	end
 
-	local primaryKey = primaryKeySignature()
-	if primaryKey ~= "player_id,itemtype,tier" then
-		local query
-		if primaryKey == "" then
-			query = "ALTER TABLE `player_supplystash` ADD PRIMARY KEY (`player_id`, `itemtype`, `tier`)"
-		else
-			query = "ALTER TABLE `player_supplystash` DROP PRIMARY KEY, ADD PRIMARY KEY (`player_id`, `itemtype`, `tier`)"
-		end
-		if not db.query(query) or primaryKeySignature() ~= "player_id,itemtype,tier" then
-			logMigration("Failed to enforce the Supply Stash primary key; existing data was left untouched")
-			return false
-		end
+	if not db.query([[CREATE TABLE IF NOT EXISTS `market_statistics` (
+		`itemtype` SMALLINT UNSIGNED NOT NULL,
+		`sale` TINYINT NOT NULL DEFAULT 0,
+		`day` INT UNSIGNED NOT NULL,
+		`transactions` INT UNSIGNED NOT NULL DEFAULT 0,
+		`total_price` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+		`highest_price` INT UNSIGNED NOT NULL DEFAULT 0,
+		`lowest_price` INT UNSIGNED NOT NULL DEFAULT 0,
+		PRIMARY KEY (`itemtype`, `sale`, `day`)
+	) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8]]) then
+		return false
 	end
 
-	local fkStatus, constraintName = checkPlayerForeignKey()
-	if fkStatus == "wrong_rule" then
-		if not db.query(
-			"ALTER TABLE `player_supplystash` DROP FOREIGN KEY `" .. constraintName .. "`"
-		) then
-			return false
-		end
-		fkStatus = false
-	end
-
-	if not fkStatus then
-		if not db.query([[
-			DELETE `stash` FROM `player_supplystash` AS `stash`
-			LEFT JOIN `players` AS `player` ON `player`.`id` = `stash`.`player_id`
-			WHERE `player`.`id` IS NULL
-		]]) or not db.query([[
-			ALTER TABLE `player_supplystash`
-			ADD CONSTRAINT `player_supplystash_player_fk`
-			FOREIGN KEY (`player_id`) REFERENCES `players` (`id`) ON DELETE CASCADE
-		]]) then
-			return false
-		end
-	end
-
-	return true
+	return ensureColumn("market_offers", "tier", "TINYINT UNSIGNED NOT NULL DEFAULT 0 AFTER `price`")
+		and ensureColumn("market_offers", "attributes", "MEDIUMBLOB NULL AFTER `tier`")
+		and ensureColumn("market_history", "tier", "TINYINT UNSIGNED NOT NULL DEFAULT 0 AFTER `price`")
+		and ensureIndex("market_offers", "idx_market_offers_item_sale_price", "`itemtype`, `sale`, `price`, `created`", "itemtype,sale,price,created")
+		and ensureIndex("market_offers", "idx_market_offers_player_created", "`player_id`, `created`", "player_id,created")
+		and ensureIndex("market_offers", "idx_market_offers_created", "`created`", "created")
+		and ensureIndex("market_history", "idx_market_history_player_inserted", "`player_id`, `inserted`", "player_id,inserted")
 end
