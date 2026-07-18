@@ -40,7 +40,7 @@ Developed and maintained by [Mateuzkl](https://github.com/Mateuzkl), based on [N
 |---|---|
 | Core | TFS 1.8 engine, protocol 8.60, C++23, Lua 5.5, MariaDB, optimized decay |
 | Maps | ClientID-native maps and items |
-| Client | Astra Client 8.6 with a CIP 15.x-style appearance |
+| Clients | OTCv8, Mehah, CipSoft, and custom client options |
 | Tooling | Automatic Ubuntu/WSL build and Windows support through vcpkg |
 
 ---
@@ -49,7 +49,7 @@ Developed and maintained by [Mateuzkl](https://github.com/Mateuzkl), based on [N
 
 Use the ClientID-compatible map editor for this source:
 
-**[Download RME-ZONES](https://github.com/Skyyzyy/RME-ZONES)**
+**[Download NexaMap Editor](https://github.com/Mateuzkl/NexaMap-Editor)**
 
 ---
 
@@ -134,11 +134,26 @@ Read the full client setup guide before changing feature flags:
 - English: [`docs/client-configuration.md`](docs/client-configuration.md)
 - PT-BR: [`docs/client-configuration.pt-BR.md`](docs/client-configuration.pt-BR.md)
 
-### Recommended Client
+## Available Clients
 
-[Astra Client 8.6](https://github.com/Mateuzkl/AstraClient) is an OTCv8 client based on OTAcademy. It uses protocol 8.60 with a layout inspired by the CIP 15.x appearance.
+Choose the client that matches the experience and feature set you want. They all target protocol 8.60, but use different engines and visual styles.
 
-> The protocol remains 8.60; CIP 15.x refers only to the visual appearance.
+### OTClient-based
+
+| Client | Description |
+|---|---|
+| [Astra Client 8.6](https://github.com/Mateuzkl/AstraClient) | OTCv8 client based on OTAcademy with a layout inspired by the CIP 15.x appearance |
+| [Otcv8--Classic-8.6](https://github.com/Mateuzkl/Otcv8--Classic-8.6) | OTCv8 Classic using the original CIP 8.60 appearance |
+| [OTC-Fonticak](https://github.com/soyfabi/OTC-Fonticak) | Alternative client based on a Mehah fork |
+
+### CipSoft and custom clients
+
+| Client | Description |
+|---|---|
+| [Client 8.60 + DLL Mount](https://github.com/Mateuzkl/Client-cip-8.60-with-DLL-Mount) | Classic CipSoft 8.60 client with mount support through a modified DLL |
+| [Forgotten Client (Alpha 1.0)](https://github.com/Mateuzkl/The-Forgotten-Client) | Future custom client currently under development |
+
+> CIP 15.x in the Astra description refers only to its visual layout. The server and every client listed here continue to use protocol 8.60.
 
 ---
 
