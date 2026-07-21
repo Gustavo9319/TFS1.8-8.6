@@ -67,9 +67,42 @@ function LeaveTraining(playerId)
 		stopEvent(onExerciseTraining[playerId].event)
 		onExerciseTraining[playerId] = nil
 	end
+end
 
-	local player = Player(playerId)
-	return
+local function findContainerItemById(container, weaponId, weaponUid)
+	if not container or not container:isContainer() then
+		return nil
+	end
+
+	for i = 0, container:getSize() - 1 do
+		local item = container:getItem(i)
+		if item then
+			if item:getId() == weaponId and item:getUniqueId() == weaponUid then
+				return item
+			end
+
+			if item:isContainer() then
+				local found = findContainerItemById(item, weaponId, weaponUid)
+				if found then
+					return found
+				end
+			end
+		end
+	end
+
+	return nil
+end
+
+local function findPlayerWeaponById(player, weaponId, weaponUid)
+	for slot = CONST_SLOT_HEAD, CONST_SLOT_AMMO do
+		local item = player:getSlotItem(slot)
+		if item and item:getId() == weaponId and item:getUniqueId() == weaponUid then
+			return item
+		end
+	end
+
+	local backpack = player:getSlotItem(CONST_SLOT_BACKPACK)
+	return findContainerItemById(backpack, weaponId, weaponUid)
 end
 
 function ExerciseEvent(playerId, tilePosition, weaponId, dummyId)
@@ -80,6 +113,11 @@ function ExerciseEvent(playerId, tilePosition, weaponId, dummyId)
 
 	local training = onExerciseTraining[playerId]
 	if not training then
+		return false
+	end
+
+	if training.ownerGuid and training.ownerGuid ~= player:getGuid() then
+		LeaveTraining(playerId)
 		return false
 	end
 
@@ -96,12 +134,14 @@ function ExerciseEvent(playerId, tilePosition, weaponId, dummyId)
         return true
     end
 
-	local weapon = training.weapon
-	if not weapon or not weapon:isItem() or weapon:getId() ~= weaponId then
+	local weapon = findPlayerWeaponById(player, weaponId, training.weaponUid)
+	if not weapon then
 		player:sendTextMessage(MESSAGE_EVENT_ADVANCE, "The training weapon is no longer available, the training has stopped.")
 		LeaveTraining(playerId)
 		return false
 	end
+
+	onExerciseTraining[playerId].weaponUid = weapon:getUniqueId()
 
 	if not isItemOwnedByPlayer(weapon, player) then
 		player:sendTextMessage(MESSAGE_EVENT_ADVANCE, "The training weapon is no longer yours, the training has stopped.")
@@ -154,6 +194,7 @@ function ExerciseEvent(playerId, tilePosition, weaponId, dummyId)
 
 	local vocation = player:getVocation()
 	onExerciseTraining[playerId].event = addEvent(ExerciseEvent, vocation:getAttackSpeed() / configManager.getNumber(configKeys.RATE_EXERCISE_TRAINING_SPEED), playerId, tilePosition, weaponId, dummyId)
+	onExerciseTraining[playerId].ownerGuid = player:getGuid()
 	return true
 end
 
