@@ -494,47 +494,6 @@ void Map::getSpectators(SpectatorVec& spectators, const Position& centerPos, boo
 	minRangeY = (minRangeY == 0 ? -maxViewportY : -minRangeY);
 	maxRangeY = (maxRangeY == 0 ? maxViewportY : maxRangeY);
 
-	bool cacheResult = (minRangeX == -maxViewportX && maxRangeX == maxViewportX &&
-	                    minRangeY == -maxViewportY && maxRangeY == maxViewportY);
-
-	SpectatorVec* cacheOpt = nullptr;
-	bool* hasCacheOpt = nullptr;
-
-	if (cacheResult) {
-		auto iter = spectatorsCache.find(centerPos);
-		if (iter != spectatorsCache.end()) {
-			auto& entry = iter->second;
-			SpectatorsCache::FloorData* cacheFloorData;
-			if (onlyPlayers) {
-				cacheFloorData = &entry.players;
-			} else if (onlyMonsters) {
-				cacheFloorData = &entry.monsters;
-			} else if (onlyNpcs) {
-				cacheFloorData = &entry.npcs;
-			} else {
-				cacheFloorData = &entry.creatures;
-			}
-
-			if (multifloor) {
-				cacheOpt = &cacheFloorData->multiFloor;
-				hasCacheOpt = &cacheFloorData->hasMultiFloor;
-			} else {
-				cacheOpt = &cacheFloorData->floor;
-				hasCacheOpt = &cacheFloorData->hasFloor;
-			}
-
-			if (*hasCacheOpt) {
-				if (!spectators.empty()) {
-					spectators.addSpectators(*cacheOpt);
-					spectators.partitionByType();
-				} else {
-					spectators = *cacheOpt;
-				}
-				return;
-			}
-		}
-	}
-
 	int32_t minRangeZ;
 	int32_t maxRangeZ;
 
@@ -557,37 +516,7 @@ void Map::getSpectators(SpectatorVec& spectators, const Position& centerPos, boo
 	                      onlyPlayers, onlyMonsters, onlyNpcs);
 
 	spectators.partitionByType();
-
-	if (cacheResult) {
-		auto [iter, inserted] = spectatorsCache.try_emplace(centerPos);
-		auto& entry = iter->second;
-		entry.minRangeX = minRangeX;
-		entry.maxRangeX = maxRangeX;
-		entry.minRangeY = minRangeY;
-		entry.maxRangeY = maxRangeY;
-
-		SpectatorsCache::FloorData* cacheFloorData;
-		if (onlyPlayers) {
-			cacheFloorData = &entry.players;
-		} else if (onlyMonsters) {
-			cacheFloorData = &entry.monsters;
-		} else if (onlyNpcs) {
-			cacheFloorData = &entry.npcs;
-		} else {
-			cacheFloorData = &entry.creatures;
-		}
-
-		if (multifloor) {
-			cacheFloorData->hasMultiFloor = true;
-			cacheFloorData->multiFloor = spectators;
-		} else {
-			cacheFloorData->hasFloor = true;
-			cacheFloorData->floor = spectators;
-		}
-	}
 }
-
-void Map::clearSpectatorCache() { spectatorsCache.clear(); }
 
 bool Map::canThrowObjectTo(const Position& fromPos, const Position& toPos, bool checkLineOfSight /*= true*/,
                            bool sameFloor /*= false*/, int32_t rangex /*= Map::maxClientViewportX*/,
@@ -815,6 +744,47 @@ bool Map::getPathMatching(const Creature& creature, std::vector<Direction>& dirL
 	Position end_position;
 	auto position = creature.getPosition();
 	auto nodes = AStarNodes(position.x, position.y);
+	const QTreeLeafNode* pathLeaf = nullptr;
+	Floor* pathFloor = nullptr;
+	uint16_t pathLeafBaseX = 0;
+	uint16_t pathLeafBaseY = 0;
+	uint8_t pathFloorZ = MAP_MAX_LAYERS;
+	const auto getPathTile = [&](const Position& tilePosition) -> const Tile* {
+		if (tilePosition.z >= MAP_MAX_LAYERS) {
+			return nullptr;
+		}
+
+		const uint16_t leafBaseX = tilePosition.x & ~FLOOR_MASK;
+		const uint16_t leafBaseY = tilePosition.y & ~FLOOR_MASK;
+		if (!pathLeaf || leafBaseX != pathLeafBaseX || leafBaseY != pathLeafBaseY) {
+			pathLeaf = QTreeNode::getLeafStatic<const QTreeLeafNode*, const QTreeNode*>(&root, tilePosition.x,
+			                                                                         tilePosition.y);
+			pathLeafBaseX = leafBaseX;
+			pathLeafBaseY = leafBaseY;
+			pathFloorZ = MAP_MAX_LAYERS;
+		}
+
+		if (pathFloorZ != tilePosition.z) {
+			pathFloor = pathLeaf ? pathLeaf->getFloor(tilePosition.z) : nullptr;
+			pathFloorZ = tilePosition.z;
+		}
+
+		return pathFloor ? pathFloor->getTile(tilePosition.x, tilePosition.y, tilePosition.z) : nullptr;
+	};
+	const auto canWalkToForPath = [&](const Position& tilePosition) -> const Tile* {
+		const Tile* tile = getPathTile(tilePosition);
+		if (creature.getTile() != tile) {
+			if (!tile) {
+				return nullptr;
+			}
+
+			const uint32_t flags = FLAG_PATHFINDING | FLAG_IGNOREFIELDDAMAGE;
+			if (tile->queryAdd(0, creature, 1, flags) != RETURNVALUE_NOERROR) {
+				return nullptr;
+			}
+		}
+		return tile;
+	};
 	const auto &target_position = pathCondition.targetPos;
 	const auto manhattan_heuristic = [&](const int_fast32_t nx, const int_fast32_t ny) -> int_fast32_t
 	{
@@ -907,8 +877,7 @@ bool Map::getPathMatching(const Creature& creature, std::vector<Direction>& dirL
 			const uint16_t neighborNodeIdx = nodes.GetNodeByPosition(position.x, position.y);
 			const bool hasNeighborNode = neighborNodeIdx != ASTAR_NODE_NONE;
 			++searchMetrics.tilesRead;
-			const Tile *tile = hasNeighborNode ? getTile(position.x, position.y, position.z)
-				: canWalkTo(creature, position);
+			const Tile* tile = hasNeighborNode ? getPathTile(position) : canWalkToForPath(position);
 
 			if (!tile) {
 				continue;

@@ -110,7 +110,9 @@ public:
 	void onRemoveCreature(Creature* creature, bool isLogout) override;
 	void onCreatureMove(Creature* creature, const Tile* newTile, const Position& newPos, const Tile* oldTile,
 	                    const Position& oldPos, bool teleport) override;
+	void onCreatureInstanceChange(Creature* creature, bool visible);
 	void onCreatureSay(Creature* creature, SpeakClasses type, std::string_view text) override;
+	void onPlacedCreature() override;
 
 	void drainHealth(const std::shared_ptr<Creature>& attacker, int32_t damage) override;
 	void changeHealth(int32_t healthChange, bool sendHealthChange = true) override;
@@ -171,11 +173,11 @@ public:
 	bool isFamiliar() const;
 	bool hasPlayerNearby(int32_t range = 20) const;
 
-	void addFriend(Creature* creature);
+	bool addFriend(Creature* creature);
 	bool setType(const std::shared_ptr<MonsterType>& newType, bool restoreHealth = false);
-	void removeFriend(Creature* creature);
-	void addTarget(Creature* creature, bool pushFront = false);
-	void removeTarget(Creature* creature);
+	bool removeFriend(Creature* creature);
+	bool addTarget(Creature* creature, bool pushFront = false);
+	bool removeTarget(Creature* creature);
 
 	void callPlayerAttackEvent(Player* player);
 
@@ -216,7 +218,7 @@ private:
 	void onCreatureEnter(Creature* creature);
 	void onCreatureLeave(Creature* creature);
 	bool selectBlockerTarget();
-	void onCreatureFound(Creature* creature, bool pushFront = false);
+	void onCreatureFound(Creature* creature, bool pushFront = false, bool refreshIdle = true);
 	bool isFactionCombatTarget(const Creature* creature) const;
 	bool isFactionCombatAllowed() const;
 	bool clearFactionTargetIfNotAllowed();
@@ -226,6 +228,10 @@ private:
 	mutable bool cachedPlayerNearby = false;
 
 	void updateTargetList();
+	void updateTargetListAfterMovement(const Position& oldPosition, const Position& newPosition);
+	bool isValidKnownFriend(const std::shared_ptr<Creature>& creature) const;
+	bool isValidKnownTarget(const std::shared_ptr<Creature>& creature) const;
+	bool pruneInvalidTargetState();
 	void clearTargetList();
 	void clearFriendList();
 
@@ -233,6 +239,7 @@ private:
 	std::shared_ptr<Item> getCorpse(Creature* lastHitCreature, Creature* mostDamageCreature) override;
 
 	void updateIdleStatus();
+	bool shouldBeIdle() const;
 
 	void onAddCondition(ConditionType_t type) override;
 	void onEndCondition(ConditionType_t type) override;

@@ -14,25 +14,6 @@
 
 class Creature;
 
-struct SpectatorsCache {
-	struct FloorData {
-		bool hasFloor{false};
-		bool hasMultiFloor{false};
-		SpectatorVec floor;
-		SpectatorVec multiFloor;
-	};
-
-	int32_t minRangeX{0};
-	int32_t maxRangeX{0};
-	int32_t minRangeY{0};
-	int32_t maxRangeY{0};
-
-	FloorData creatures;
-	FloorData monsters;
-	FloorData npcs;
-	FloorData players;
-};
-
 struct PositionHasher {
 	std::size_t operator()(const Position& pos) const {
 		std::size_t h = 0;
@@ -89,8 +70,6 @@ private:
 	uint16_t current_node;
 	int_fast32_t closed_nodes;
 };
-
-using SpectatorCache = absl::flat_hash_map<Position, SpectatorsCache, PositionHasher>;
 
 inline constexpr int32_t FLOOR_BITS = 3;
 inline constexpr int32_t FLOOR_SIZE = (1 << FLOOR_BITS);
@@ -278,8 +257,6 @@ public:
 	                   bool onlyPlayers = false, int32_t minRangeX = 0, int32_t maxRangeX = 0, int32_t minRangeY = 0,
 	                   int32_t maxRangeY = 0, bool onlyMonsters = false, bool onlyNpcs = false);
 
-	void clearSpectatorCache();
-
 	/**
 	 * Checks if you can throw an object to that position
 	 * \param fromPos from Source point
@@ -338,8 +315,6 @@ public:
 	MapLoadStatus getSpawnLoadStatus() const { return spawnLoadStatus; }
 
 private:
-	SpectatorCache spectatorsCache;
-
 	QTreeNode root;
 
 	// Single-entry cache of the last leaf touched by setTile/setBasicTile.

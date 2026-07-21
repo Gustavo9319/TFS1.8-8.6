@@ -62,6 +62,55 @@ Creature::~Creature()
 	eventsList.clear();
 }
 
+void Creature::setInstanceID(uint32_t id)
+{
+	const uint32_t oldInstanceId = getInstanceID();
+	if (oldInstanceId == id) {
+		return;
+	}
+
+	Tile* tile = getTile();
+	if (!tile || isRemoved()) {
+		Thing::setInstanceID(id);
+		return;
+	}
+
+	auto self = weak_from_this().lock();
+	if (!self) {
+		Thing::setInstanceID(id);
+		return;
+	}
+
+	SpectatorVec oldSpectators;
+	g_game.map.getSpectators(oldSpectators, getPosition(), true);
+	Thing::setInstanceID(id);
+	for (const auto& spectator : oldSpectators.monsters()) {
+		if (spectator.get() != this && spectator->compareInstance(oldInstanceId)) {
+			if (Monster* monster = spectator->getMonster()) {
+				monster->onCreatureInstanceChange(this, false);
+			}
+		}
+	}
+
+	if (isRemoved()) {
+		return;
+	}
+
+	if (Monster* monster = getMonster()) {
+		monster->onCreatureInstanceChange(this, true);
+	}
+
+	SpectatorVec newSpectators;
+	g_game.map.getSpectators(newSpectators, getPosition(), true);
+	for (const auto& spectator : newSpectators.monsters()) {
+		if (spectator.get() != this && spectator->compareInstance(id)) {
+			if (Monster* monster = spectator->getMonster()) {
+				monster->onCreatureInstanceChange(this, true);
+			}
+		}
+	}
+}
+
 bool Creature::canSee(const Position& myPos, const Position& pos, int32_t viewRangeX, int32_t viewRangeY)
 {
 	if (myPos.z <= 7) {
@@ -479,7 +528,10 @@ void Creature::onCreatureMove(Creature* creature, const Tile* newTile, const Pos
 			requestFollowPathUpdate();
 		}
 
-		if (newPos.z != oldPos.z || !canSee(fc->getPosition())) {
+		auto masterCreature = master.lock();
+		const bool followsLiveMaster = masterCreature && masterCreature == fc && !masterCreature->isRemoved() &&
+		                               !masterCreature->isDead();
+		if (!followsLiveMaster && (newPos.z != oldPos.z || !canSee(fc->getPosition()))) {
 			onCreatureDisappear(fc.get(), false);
 		}
 	}
@@ -1300,11 +1352,10 @@ bool Creature::setMaster(Creature* newMaster)
 		newMasterSummons.emplace_back(self);
 	}
 
+	master = std::move(masterRef);
 	if (getInstanceID() != newMaster->getInstanceID()) {
 		setInstanceID(newMaster->getInstanceID());
 	}
-
-	master = std::move(masterRef);
 	return true;
 }
 
@@ -1485,6 +1536,7 @@ Condition* Creature::getCondition(ConditionType_t type, ConditionId_t conditionI
 
 void Creature::executeConditions(uint32_t interval)
 {
+	PerformanceScope performanceScope(PerformanceMetric::CreatureExecuteConditions);
 	std::vector<Condition*> tempConditions;
 	tempConditions.reserve(conditions.size());
 	for (const auto& c : conditions) {

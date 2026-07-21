@@ -13,6 +13,7 @@ PerformanceMetrics g_performanceMetrics;
 
 namespace {
 constexpr auto REPORT_INTERVAL = std::chrono::seconds(5);
+constexpr auto AREA_COMBAT_SLOW_SAMPLE_THRESHOLD = std::chrono::milliseconds(1);
 
 constexpr std::array<std::string_view, static_cast<size_t>(PerformanceMetric::Count)> METRIC_NAMES = {
 	"TaskReactor::runOnce", "TaskReactor::drainInbox", "TaskReactor::drainReadyTasks",
@@ -22,7 +23,22 @@ constexpr std::array<std::string_view, static_cast<size_t>(PerformanceMetric::Co
 	"Game::internalMoveCreature", "Map::getPathMatching", "Map::moveCreature", "Map::getSpectators",
 	"Monster::onThink",
 	"Monster::onWalk", "Monster::doAttacking", "CombatSpell::castSpell",
-	"Combat::doCombat", "Combat::doAreaCombat",
+	"Combat::doCombat", "Combat::doAreaCombat", "Combat::area.buildTiles",
+	"Combat::area.prepareDamage", "Combat::area.collectSpectators", "Combat::area.processTiles+collectTargets",
+	"Combat::area.applyTargets", "Creature::executeConditions",
+};
+
+constexpr std::array<std::string_view, static_cast<size_t>(MonsterIdleMetric::Count)> MONSTER_IDLE_METRIC_NAMES = {
+	"refresh_calls", "decision_true", "decision_false", "transition_to_idle", "transition_to_active",
+	"same_state_calls", "prune_calls", "targets_pruned", "friends_pruned", "attacked_cleared",
+	"follow_cleared", "blocked_by_target", "blocked_by_condition", "blocked_by_summon", "blocked_by_faction",
+	"active_without_reason", "on_idle_status_calls", "damage_map_clears", "creature_check_adds",
+	"creature_check_removes",
+};
+
+constexpr std::array<std::string_view, static_cast<size_t>(MonsterActiveReason::Count)> MONSTER_ACTIVE_REASON_NAMES = {
+	"target_list", "attacked_creature", "follow_creature", "aggressive_condition", "summon",
+	"faction_target", "unknown",
 };
 
 size_t histogramIndex(uint64_t nanoseconds) noexcept
@@ -179,6 +195,72 @@ void PerformanceMetrics::recordPathRequest(bool success, uint64_t nodesVisited, 
 	path.pathLength.fetch_add(pathLength, std::memory_order_relaxed);
 }
 
+void PerformanceMetrics::recordAreaCombat(const AreaCombatMetricsSample& sample, std::string_view monsterName,
+                                          std::string_view spellName) noexcept
+{
+	if (!isEnabled()) {
+		return;
+	}
+
+	areaCombat.casts.fetch_add(1, std::memory_order_relaxed);
+	areaCombat.areaRows.fetch_add(sample.areaRows, std::memory_order_relaxed);
+	areaCombat.areaColumns.fetch_add(sample.areaColumns, std::memory_order_relaxed);
+	areaCombat.activeCells.fetch_add(sample.activeCells, std::memory_order_relaxed);
+	areaCombat.sightChecks.fetch_add(sample.sightChecks, std::memory_order_relaxed);
+	areaCombat.sightRejected.fetch_add(sample.sightRejected, std::memory_order_relaxed);
+	areaCombat.tilesReturned.fetch_add(sample.tilesReturned, std::memory_order_relaxed);
+	areaCombat.tilesCreated.fetch_add(sample.tilesCreated, std::memory_order_relaxed);
+	areaCombat.combatRejected.fetch_add(sample.combatRejected, std::memory_order_relaxed);
+	areaCombat.spectators.fetch_add(sample.spectators, std::memory_order_relaxed);
+	areaCombat.targets.fetch_add(sample.targets, std::memory_order_relaxed);
+	areaCombat.blockedTargets.fetch_add(sample.blockedTargets, std::memory_order_relaxed);
+	areaCombat.appliedTargets.fetch_add(sample.appliedTargets, std::memory_order_relaxed);
+	areaCombat.conditionClones.fetch_add(sample.conditionClones, std::memory_order_relaxed);
+	areaCombat.tileCallbacks.fetch_add(sample.tileCallbacks, std::memory_order_relaxed);
+	areaCombat.targetCallbacks.fetch_add(sample.targetCallbacks, std::memory_order_relaxed);
+	areaCombat.impactEffects.fetch_add(sample.impactEffects, std::memory_order_relaxed);
+	areaCombat.fieldsCreated.fetch_add(sample.fieldsCreated, std::memory_order_relaxed);
+	areaCombat.effectRecipients.fetch_add(sample.effectRecipients, std::memory_order_relaxed);
+
+	if (sample.totalNanoseconds < static_cast<uint64_t>(
+	        std::chrono::duration_cast<std::chrono::nanoseconds>(AREA_COMBAT_SLOW_SAMPLE_THRESHOLD).count()) ||
+	    sample.totalNanoseconds <= slowestAreaCombat.maximumNanoseconds.load(std::memory_order_relaxed)) {
+		return;
+	}
+
+	try {
+		std::scoped_lock lock(slowestAreaCombat.mutex);
+		if (sample.totalNanoseconds <= slowestAreaCombat.maximumNanoseconds.load(std::memory_order_relaxed)) {
+			return;
+		}
+		slowestAreaCombat.sample = sample;
+		slowestAreaCombat.monsterName.assign(monsterName);
+		slowestAreaCombat.spellName.assign(spellName);
+		slowestAreaCombat.maximumNanoseconds.store(sample.totalNanoseconds, std::memory_order_relaxed);
+	} catch (...) {
+		// Profiling must never interfere with combat execution.
+	}
+}
+
+void PerformanceMetrics::recordMonsterIdle(MonsterIdleMetric metric, uint64_t count) noexcept
+{
+	if (isEnabled()) {
+		monsterIdle[static_cast<size_t>(metric)].fetch_add(count, std::memory_order_relaxed);
+	}
+}
+
+void PerformanceMetrics::recordMonsterActiveReason(MonsterActiveReason reason, uint64_t count) noexcept
+{
+	if (isEnabled()) {
+		monsterActiveReasons[static_cast<size_t>(reason)].fetch_add(count, std::memory_order_relaxed);
+	}
+}
+
+uint64_t PerformanceMetrics::getMonsterIdleMetric(MonsterIdleMetric metric) const noexcept
+{
+	return monsterIdle[static_cast<size_t>(metric)].load(std::memory_order_relaxed);
+}
+
 void PerformanceMetrics::maybeReport()
 {
 	if (!isEnabled()) {
@@ -194,7 +276,7 @@ void PerformanceMetrics::maybeReport()
 	}
 
 	std::string report;
-	report.reserve(4096);
+	report.reserve(8192);
 	for (size_t metricIndex = 0; metricIndex < metrics.size(); ++metricIndex) {
 		auto& data = metrics[metricIndex];
 		const uint64_t calls = data.calls.exchange(0, std::memory_order_relaxed);
@@ -224,6 +306,97 @@ void PerformanceMetrics::maybeReport()
 		reactor.deferred.exchange(0, std::memory_order_relaxed),
 		reactor.expired.exchange(0, std::memory_order_relaxed),
 		reactor.dropped.exchange(0, std::memory_order_relaxed));
+
+	const uint64_t areaCombatCasts = areaCombat.casts.exchange(0, std::memory_order_relaxed);
+	if (areaCombatCasts > 0) {
+		report += fmt::format(
+			"[Perf] area_combat casts={} rows={} cols={} active_cells={} sight_checks={} sight_rejected={} "
+			"tiles={} tiles_created={} combat_rejected={} spectators={} collect_targets={} blocked={} applied={} "
+			"condition_clones={} tile_callbacks={} target_callbacks={} effects={} fields={} recipients={}\n",
+			areaCombatCasts,
+			areaCombat.areaRows.exchange(0, std::memory_order_relaxed),
+			areaCombat.areaColumns.exchange(0, std::memory_order_relaxed),
+			areaCombat.activeCells.exchange(0, std::memory_order_relaxed),
+			areaCombat.sightChecks.exchange(0, std::memory_order_relaxed),
+			areaCombat.sightRejected.exchange(0, std::memory_order_relaxed),
+			areaCombat.tilesReturned.exchange(0, std::memory_order_relaxed),
+			areaCombat.tilesCreated.exchange(0, std::memory_order_relaxed),
+			areaCombat.combatRejected.exchange(0, std::memory_order_relaxed),
+			areaCombat.spectators.exchange(0, std::memory_order_relaxed),
+			areaCombat.targets.exchange(0, std::memory_order_relaxed),
+			areaCombat.blockedTargets.exchange(0, std::memory_order_relaxed),
+			areaCombat.appliedTargets.exchange(0, std::memory_order_relaxed),
+			areaCombat.conditionClones.exchange(0, std::memory_order_relaxed),
+			areaCombat.tileCallbacks.exchange(0, std::memory_order_relaxed),
+			areaCombat.targetCallbacks.exchange(0, std::memory_order_relaxed),
+			areaCombat.impactEffects.exchange(0, std::memory_order_relaxed),
+			areaCombat.fieldsCreated.exchange(0, std::memory_order_relaxed),
+			areaCombat.effectRecipients.exchange(0, std::memory_order_relaxed));
+	}
+
+	bool hasMonsterIdleMetrics = false;
+	std::array<uint64_t, static_cast<size_t>(MonsterIdleMetric::Count)> monsterIdleValues{};
+	for (size_t i = 0; i < monsterIdleValues.size(); ++i) {
+		monsterIdleValues[i] = monsterIdle[i].exchange(0, std::memory_order_relaxed);
+		hasMonsterIdleMetrics = hasMonsterIdleMetrics || monsterIdleValues[i] != 0;
+	}
+	if (hasMonsterIdleMetrics) {
+		report += "[Perf] monster_idle";
+		for (size_t i = 0; i < monsterIdleValues.size(); ++i) {
+			report += fmt::format(" {}={}", MONSTER_IDLE_METRIC_NAMES[i], monsterIdleValues[i]);
+		}
+		report += '\n';
+	}
+
+	bool hasMonsterActiveReasons = false;
+	std::array<uint64_t, static_cast<size_t>(MonsterActiveReason::Count)> monsterActiveReasonValues{};
+	for (size_t i = 0; i < monsterActiveReasonValues.size(); ++i) {
+		monsterActiveReasonValues[i] = monsterActiveReasons[i].exchange(0, std::memory_order_relaxed);
+		hasMonsterActiveReasons = hasMonsterActiveReasons || monsterActiveReasonValues[i] != 0;
+	}
+	if (hasMonsterActiveReasons) {
+		report += "[Perf] monster_active_reason";
+		for (size_t i = 0; i < monsterActiveReasonValues.size(); ++i) {
+			report += fmt::format(" {}={}", MONSTER_ACTIVE_REASON_NAMES[i], monsterActiveReasonValues[i]);
+		}
+		report += '\n';
+	}
+
+	AreaCombatMetricsSample slowestAreaSample;
+	std::string slowestAreaMonster;
+	std::string slowestAreaSpell;
+	uint64_t slowestAreaNanoseconds = 0;
+	{
+		std::scoped_lock lock(slowestAreaCombat.mutex);
+		slowestAreaNanoseconds = slowestAreaCombat.maximumNanoseconds.exchange(0, std::memory_order_relaxed);
+		if (slowestAreaNanoseconds > 0) {
+			slowestAreaSample = slowestAreaCombat.sample;
+			slowestAreaMonster = std::move(slowestAreaCombat.monsterName);
+			slowestAreaSpell = std::move(slowestAreaCombat.spellName);
+			slowestAreaCombat.sample = {};
+		}
+	}
+	if (slowestAreaNanoseconds > 0) {
+		report += fmt::format(
+			"[Perf] area_combat slowest_us={:.3f} monster={} spell={} mode={} pos=({},{},{}) "
+			"geometry={}x{} active={} tiles={} created={} targets={} item={} effect={} "
+			"conditions={} tile_callback={} target_callback={} "
+			"phases_us={{build:{:.3f},prepare:{:.3f},spectators:{:.3f},process_tiles_collect_targets:{:.3f},apply_targets:{:.3f}}}\n",
+			slowestAreaNanoseconds / 1'000.0,
+			slowestAreaMonster.empty() ? "none" : slowestAreaMonster,
+			slowestAreaSpell.empty() ? "unknown" : slowestAreaSpell,
+			slowestAreaSample.scripted ? "scripted" : "native",
+			slowestAreaSample.positionX, slowestAreaSample.positionY, slowestAreaSample.positionZ,
+			slowestAreaSample.areaRows, slowestAreaSample.areaColumns, slowestAreaSample.activeCells,
+			slowestAreaSample.tilesReturned, slowestAreaSample.tilesCreated, slowestAreaSample.targets,
+			slowestAreaSample.itemId, slowestAreaSample.impactEffect,
+			slowestAreaSample.hasConditions, slowestAreaSample.hasTileCallback, slowestAreaSample.hasTargetCallback,
+			slowestAreaSample.buildTilesNanoseconds / 1'000.0,
+			slowestAreaSample.prepareDamageNanoseconds / 1'000.0,
+			slowestAreaSample.collectSpectatorsNanoseconds / 1'000.0,
+			slowestAreaSample.processTilesNanoseconds / 1'000.0,
+			slowestAreaSample.applyTargetsNanoseconds / 1'000.0);
+	}
 
 	uint64_t slowestNanoseconds = 0;
 	std::string slowestDescription;
