@@ -3906,19 +3906,19 @@ void ProtocolGame::sendToChannel(const Creature* creature, SpeakClasses type, st
 
 void ProtocolGame::sendPrivateMessage(const Player* speaker, SpeakClasses type, std::string_view text)
 {
+	if (!speaker) {
+		return;
+	}
+
 	NetworkMessage msg;
 	msg.addByte(0xAA);
 	static uint32_t statementId = 0;
 	msg.add<uint32_t>(++statementId);
-	if (speaker) {
-		msg.addString(speaker->getName());
-		if (!speaker->isAccessPlayer()) {
-			msg.add<uint16_t>(static_cast<uint16_t>(speaker->getLevel()));
-		} else {
-			msg.add<uint32_t>(0x00);
-		}
+	msg.addString(speaker->getName());
+	if (!speaker->isAccessPlayer()) {
+		msg.add<uint16_t>(static_cast<uint16_t>(speaker->getLevel()));
 	} else {
-		msg.add<uint32_t>(0x00);
+		msg.add<uint16_t>(0x00);
 	}
 	msg.addByte(type);
 	msg.addString(text);
