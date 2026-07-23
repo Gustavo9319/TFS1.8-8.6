@@ -11,6 +11,8 @@ on:
       - 'cmake/**'
       - CMakeLists.txt
       - vcpkg.json
+      - 'tools/*.cmake'
+      - 'tools/patches/lua-5.5.0-write-barrier.patch'
       - '.github/workflows/build.yml'
   pull_request:
     branches:
@@ -20,6 +22,8 @@ on:
       - 'cmake/**'
       - CMakeLists.txt
       - vcpkg.json
+      - 'tools/*.cmake'
+      - 'tools/patches/lua-5.5.0-write-barrier.patch'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
@@ -45,20 +49,23 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
             cmake ninja-build build-essential pkg-config \
+            patch \
             gcc g++ \
             libssl-dev zlib1g-dev libfmt-dev libspdlog-dev \
             libpugixml-dev libabsl-dev \
             libasio-dev \
             default-libmysqlclient-dev
 
-      - name: Build Lua 5.5 from source
+      - name: Build patched Lua 5.5 from source
         run: |
           curl -sSL https://www.lua.org/ftp/lua-5.5.0.tar.gz -o lua.tar.gz
           echo "57ccc32bbbd005cab75bcc52444052535af691789dba2b9016d5c50640d68b3d lua.tar.gz" | sha256sum -c
           tar xzf lua.tar.gz
           cd lua-5.5.0
+          patch -d src -p1 < "$GITHUB_WORKSPACE/tools/patches/lua-5.5.0-write-barrier.patch"
           make -j$(nproc) linux MYCFLAGS="-fPIC"
           sudo make install INSTALL_TOP=/usr/local
+          /usr/local/bin/lua -e 'local p={}; p.__newindex=p; collectgarbage(); local c=setmetatable({},p); c.__newindex={x="hello"}; collectgarbage("step"); assert(p.__newindex.x=="hello")'
           cd ..
           rm -rf lua-5.5.0 lua.tar.gz
 
@@ -96,6 +103,7 @@ jobs:
           -DENABLE_NATIVE_OPTIMIZATIONS=OFF
           -DENABLE_SLOW_TASK_DETECTION=OFF
           -DUSE_MIMALLOC=OFF
+          -DBUILD_TESTING=ON
           -DSKIP_GIT=OFF
           -DLUA_INCLUDE_DIR=/usr/local/include
           -DLUA_LIBRARY=/usr/local/lib/liblua.a
@@ -104,6 +112,9 @@ jobs:
 
       - name: Build
         run: cmake --build build --parallel $(nproc)
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure
 
       - name: Verify binary
         run: |

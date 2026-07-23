@@ -153,6 +153,13 @@ public:
 	[[nodiscard]] std::shared_ptr<Creature> getCreatureByIDShared(uint32_t id) const;
 
 	/**
+	 * Returns a creature based on a string name identifier
+	 * \param s is the name identifier
+	 * \returns A shared pointer to the creature
+	 */
+	[[nodiscard]] std::shared_ptr<Creature> getCreatureByNameShared(std::string_view s);
+
+	/**
 	 * Returns a monster based on the unique creature identifier
 	 * \param id is the unique monster id to get a monster pointer to
 	 * \returns A Monster pointer to the monster
@@ -174,13 +181,6 @@ public:
 	 * \returns A shared pointer to the player
 	 */
 	[[nodiscard]] std::shared_ptr<Player> getPlayerByID(uint32_t id);
-
-	/**
-	 * Returns a creature based on a string name identifier
-	 * \param s is the name identifier
-	 * \returns A Pointer to the creature
-	 */
-	[[nodiscard]] Creature* getCreatureByName(std::string_view s);
 
 	/**
 	 * Returns a npc based on a string name identifier
@@ -470,7 +470,7 @@ public:
 	void playerEnableSharedPartyExperience(uint32_t playerId, bool sharedExpActive);
 
 	void parsePlayerExtendedOpcode(uint32_t playerId, uint8_t opcode, std::string_view buffer);
-	void parsePlayerNetworkMessage(uint32_t playerId, uint8_t recvByte, NetworkMessage_ptr msg);
+	void parsePlayerNetworkMessage(uint32_t playerId, uint8_t recvByte, NetworkMessage_ptr& msg);
 
 	// Spy system
 	bool playerStartSpy(uint32_t godPlayerId, const std::string& targetName);
@@ -733,6 +733,7 @@ private:
 	std::vector<std::shared_ptr<Creature>> checkCreatureLists[EVENT_CREATURECOUNT];
 
 	std::vector<std::shared_ptr<Creature>> ToReleaseCreatures;
+	std::unordered_set<const Creature*> ToReleaseCreatureSet;
 	std::vector<std::shared_ptr<Item>> ToReleaseItems;
 
 	size_t lastBucket = 0;

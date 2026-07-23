@@ -6,6 +6,7 @@
 
 #include "chat.h"
 #include "creature.h"
+#include "packet_backlog.h"
 #include "protocol.h"
 #include "tasks.h"
 #include "zoneweather.h"
@@ -84,6 +85,7 @@ private:
 	void connect(uint32_t playerId, OperatingSystem_t operatingSystem);
 	void finishLogin(uint32_t reservedGuid, uint32_t accountId, bool loaded, OperatingSystem_t operatingSystem);
 	void disconnectClient(std::string_view message) const;
+	void dispatchCancelMessage(ReturnValue message) const;
 	void writeToOutputBuffer(const NetworkMessage& msg);
 
 	void release() override;
@@ -96,6 +98,7 @@ private:
 
 	// we have all the parse methods
 	void parsePacket(NetworkMessage& msg) override;
+	void parsePacketOnDispatcher(NetworkMessage_ptr& packet);
 	void onRecvFirstMessage(NetworkMessage& msg) override;
 	void onConnect() override;
 
@@ -321,7 +324,7 @@ private:
 	}
 
 	// OTCv8
-	void sendFeatures();
+	void sendFeatures(bool advertiseAstraItemState = false);
 	bool shouldSendQuickLootFlags() const;
 	bool shouldSendContainerPagination() const;
 	bool shouldPaginateContainer(const Container* container) const;
@@ -366,6 +369,7 @@ private:
 
 	std::unordered_set<uint32_t> knownCreatureSet;
 	std::shared_ptr<Player> player;
+	tfs::net::PacketBacklog packetBacklog;
 
 	uint32_t eventConnect = 0;
 	uint32_t challengeTimestamp = 0;

@@ -384,7 +384,20 @@ void IOLoginData::loadPlayerGuild(Player* player)
 
 void IOLoginData::loadPlayerWorldData(Player* player)
 {
+	if (!player) {
+		return;
+	}
+
 	loadPlayerGuild(player);
+
+	// Inventory ownership is established by the login worker, but notification
+	// side effects can execute Lua and therefore belong to the dispatcher.
+	for (int32_t slot = CONST_SLOT_FIRST; slot <= CONST_SLOT_LAST; ++slot) {
+		Item* item = player->getInventoryItem(static_cast<slots_t>(slot));
+		if (item) {
+			player->postAddNotification(item, nullptr, slot);
+		}
+	}
 }
 
 bool IOLoginData::loadPlayer(Player* player, DBResult_ptr result, bool deferWorldData)
@@ -871,7 +884,7 @@ bool IOLoginData::loadPlayer(Player* player, DBResult_ptr result, bool deferWorl
 	if ((result = db.storeQuery(
 	         fmt::format("SELECT `key`, `value` FROM `player_storage` WHERE `player_id` = {:d}", player->getGUID())))) {
 		do {
-			player->setStorageValue(result->getNumber<uint32_t>("key"), result->getNumber<int64_t>("value"), true);
+			player->loadStorageValue(result->getNumber<uint32_t>("key"), result->getNumber<int64_t>("value"));
 		} while (result->next());
 	}
 

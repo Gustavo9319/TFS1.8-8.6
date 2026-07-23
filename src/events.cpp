@@ -8,6 +8,7 @@
 #include "item.h"
 #include "monster.h"
 #include "player.h"
+#include "tasks.h"
 #include "imbuement.h"
 #include "logger.h"
 #include <fmt/format.h>
@@ -353,11 +354,15 @@ void Events::eventCreatureOnChangeZone(Creature* creature, ZoneType_t fromZone, 
 	scriptInterface.callVoidFunction(3);
 }
 
-void Events::eventCreatureOnUpdateStorage(Creature* creature, const uint32_t key, const std::optional<int32_t> value,
-                                          const std::optional<int32_t> oldValue, bool isSpawn)
+void Events::eventCreatureOnUpdateStorage(Creature* creature, const uint32_t key, const std::optional<int64_t> value,
+                                          const std::optional<int64_t> oldValue)
 {
-	// Creature:onUpdateStorage(key, value, oldValue, isSpawn)
+	// Creature:onUpdateStorage(key, value, oldValue)
 	if (info.creatureOnUpdateStorage == -1) {
+		return;
+	}
+	if (!g_dispatcher.isDispatcherThread()) {
+		LOG_ERROR("[Events::eventCreatureOnUpdateStorage] Refusing to execute Lua outside the dispatcher thread.");
 		return;
 	}
 
@@ -373,7 +378,7 @@ void Events::eventCreatureOnUpdateStorage(Creature* creature, const uint32_t key
 	scriptInterface.pushFunction(info.creatureOnUpdateStorage);
 
 	Lua::pushUserdata<Creature>(L, creature);
-	Lua::setMetatable(L, -1, "Creature");
+	Lua::setCreatureMetatable(L, -1, creature);
 
 	lua_pushinteger(L, key);
 	if (value) {
@@ -388,9 +393,7 @@ void Events::eventCreatureOnUpdateStorage(Creature* creature, const uint32_t key
 		lua_pushnil(L);
 	}
 
-	Lua::pushBoolean(L, isSpawn);
-
-	scriptInterface.callVoidFunction(5);
+	scriptInterface.callVoidFunction(4);
 }
 
 // Party
@@ -1185,6 +1188,10 @@ void Events::eventPlayerOnUpdateInventory(Player* player, Item* item, const slot
 {
 	// Player:onUpdateInventory(item, slot, equip)
 	if (info.playerOnUpdateInventory == -1) {
+		return;
+	}
+	if (!g_dispatcher.isDispatcherThread()) {
+		LOG_ERROR("[Events::eventPlayerOnUpdateInventory] Refusing to execute Lua outside the dispatcher thread.");
 		return;
 	}
 

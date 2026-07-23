@@ -22,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <shared_mutex>
 
 class Creature;
 
@@ -114,7 +115,14 @@ public:
 	std::shared_ptr<Creature> asCreature() { return weak_from_this().lock(); }
 	std::shared_ptr<const Creature> asCreature() const { return weak_from_this().lock(); }
 
-	static bool isAlive(const Creature* c) { return liveCreatures.count(c) > 0; }
+	static bool isAlive(const Creature* c) {
+		if (!c) {
+			return false;
+		}
+		std::shared_lock lock(liveCreaturesMutex);
+		return liveCreatures.count(c) > 0;
+	}
+
 	virtual Player* getPlayer() { return nullptr; }
 	virtual const Player* getPlayer() const { return nullptr; }
 	virtual Npc* getNpc() { return nullptr; }
@@ -294,6 +302,7 @@ public:
 	CreatureVector getKillers() const;
 	void onDeath();
 	virtual uint64_t getGainedExperience(const std::shared_ptr<Creature>& attacker) const;
+	virtual uint64_t getGainedExperience(const std::shared_ptr<Creature>& attacker, double damageRatio) const;
 	void addDamagePoints(const std::shared_ptr<Creature>& attacker, int32_t damagePoints);
 	bool hasBeenAttacked(uint32_t attackerId);
 
@@ -382,6 +391,7 @@ public:
 
 	Tile* getTile() override final { return tile.lock().get(); }
 	const Tile* getTile() const override final { return tile.lock().get(); }
+	std::shared_ptr<Tile> getTileShared() { return tile.lock(); }
 
 	const Position& getLastPosition() const { return lastPosition; }
 	void setLastPosition(Position newLastPos) { lastPosition = newLastPos; }
@@ -395,7 +405,8 @@ public:
 	               int32_t maxTargetDist, bool fullPathSearch = true, bool clearSight = true,
 	               int32_t maxSearchDist = 0) const;
 
-	virtual void setStorageValue(uint32_t key, std::optional<int64_t> value, bool isSpawn = false);
+	virtual void setStorageValue(uint32_t key, std::optional<int64_t> value);
+	void loadStorageValue(uint32_t key, int64_t value);
 	virtual std::optional<int64_t> getStorageValue(uint32_t key) const;
 	using StorageMap = absl::flat_hash_map<uint32_t, int64_t>;
 	const StorageMap& getStorageMap() const { return storageMap; }
@@ -409,6 +420,7 @@ public:
 	void setDefaultOutfit(Outfit_t outfit) { defaultOutfit = outfit; }
 
 	const auto& getDamageMap() const { return damageMap; }
+	auto getDamageMapSnapshot() const { return damageMap; }
 
 protected:
 	struct CountBlock_t
@@ -417,9 +429,11 @@ protected:
 		int64_t ticks;
 	};
 
+	using CountMap = absl::flat_hash_map<uint32_t, CountBlock_t>;
+	double getDamageRatio(const std::shared_ptr<Creature>& attacker, const CountMap& damageCounts) const;
+
 	Position position;
 
-	using CountMap = absl::flat_hash_map<uint32_t, CountBlock_t>;
 	CountMap damageMap;
 
 	SummonList summons;
@@ -551,6 +565,7 @@ private:
 	std::map<std::string, CreatureIcon> creatureIcons;
 
 	static std::unordered_set<const Creature*> liveCreatures;
+	static std::shared_mutex liveCreaturesMutex;
 };
 
 template <typename T>

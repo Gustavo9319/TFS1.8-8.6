@@ -183,12 +183,6 @@ public:
 	const std::string& getName() const override { return name; }
 	void setName(std::string_view name) { this->name = name; }
 	const std::string& getNameDescription() const override { return name; }
-	std::string getDisplayName() const {
-		if (reset > 0) {
-			return name + " [" + std::to_string(reset) + "]";
-		}
-		return name;
-	}
 	std::string getDescription(int32_t lookDistance) const override;
 
 	CreatureType_t getType() const override { return CREATURETYPE_PLAYER; }
@@ -493,7 +487,8 @@ public:
 
 	bool canOpenCorpse(uint32_t ownerId) const;
 
-	void setStorageValue(const uint32_t key, const std::optional<int64_t> value, const bool isSpawn = false) override;
+	void setStorageValue(const uint32_t key, const std::optional<int64_t> value) override;
+	void loadStorageValue(uint32_t key, int64_t value);
 	const std::unordered_set<uint32_t>& getModifiedStorageKeys() const { return modifiedStorageKeys; }
 	const std::unordered_set<uint32_t>& getRemovedStorageKeys() const { return removedStorageKeys; }
 	bool hasStorageDirty() const { return !modifiedStorageKeys.empty() || !removedStorageKeys.empty(); }
@@ -900,6 +895,7 @@ public:
 	void addInFightTicks(bool pzlock = false);
 
 	uint64_t getGainedExperience(const std::shared_ptr<Creature>& attacker) const override;
+	uint64_t getGainedExperience(const std::shared_ptr<Creature>& attacker, double damageRatio) const override;
 
 	// combat event functions
 	void onAddCondition(ConditionType_t type) override;

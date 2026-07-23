@@ -256,6 +256,21 @@ ScriptEnvironment::ScriptEnvironment() { resetEnv(); }
 
 ScriptEnvironment::~ScriptEnvironment() { resetEnv(); }
 
+void ScriptEnvironment::setScriptId(int32_t newScriptId, LuaScriptInterface* scriptInterface)
+{
+	scriptId = newScriptId;
+	interface = scriptInterface;
+
+	if (!scriptInterface) {
+		clearLuaCrashContext();
+		return;
+	}
+
+	const std::string_view origin = timerEvent && !timerEventOrigin.empty() ? std::string_view(timerEventOrigin)
+	                                                                        : scriptInterface->getFileById(newScriptId);
+	setLuaCrashContext(scriptInterface->getInterfaceName(), origin, newScriptId);
+}
+
 void ScriptEnvironment::resetEnv()
 {
 	scriptId = 0;
@@ -309,6 +324,12 @@ bool ScriptEnvironment::setCallbackId(int32_t callbackId, LuaScriptInterface* sc
 
 	this->callbackId = callbackId;
 	interface = scriptInterface;
+	if (scriptInterface) {
+		setLuaCrashContext(scriptInterface->getInterfaceName(), scriptInterface->getFileById(callbackId), callbackId);
+		setLuaCrashPhase("registered Lua callback");
+	} else {
+		clearLuaCrashContext();
+	}
 	return true;
 }
 
@@ -512,6 +533,37 @@ LuaScriptInterface::~LuaScriptInterface()
 	cacheFiles.clear();
 }
 
+void LuaScriptInterface::resetScriptEnv()
+{
+	assert(scriptEnvIndex >= 0);
+	// Rollback any open transaction leaked by the script that just ended
+	if (Database::getInstance().isInTransaction()) {
+		Database::getInstance().rollback();
+		scriptEnv[scriptEnvIndex].hasOpenTransaction = false;
+	}
+	scriptEnv[scriptEnvIndex--].resetEnv();
+
+	if (!hasScriptEnv()) {
+		clearLuaCrashContext();
+		return;
+	}
+
+	ScriptEnvironment* outerEnv = getScriptEnv();
+	LuaScriptInterface* outerInterface = outerEnv->getScriptInterface();
+	if (!outerInterface) {
+		clearLuaCrashContext();
+		return;
+	}
+
+	const int32_t activeScriptId =
+	    outerEnv->getCallbackId() != 0 ? outerEnv->getCallbackId() : outerEnv->getScriptId();
+	const std::string_view origin = outerEnv->getTimerEventOrigin().empty()
+	                                    ? outerInterface->getFileById(activeScriptId)
+	                                    : std::string_view(outerEnv->getTimerEventOrigin());
+	setLuaCrashContext(outerInterface->getInterfaceName(), origin, activeScriptId);
+	setLuaCrashPhase("resumed outer Lua callback");
+}
+
 bool LuaScriptInterface::reInitState()
 {
 	g_luaEnvironment.clearCombatObjects(this);
@@ -539,11 +591,14 @@ void LuaEnvironment::shutdown()
 /// Same as lua_pcall, but adds stack trace to error strings in called function.
 int LuaScriptInterface::protectedCall(lua_State* L, int nargs, int nresults)
 {
+	setLuaCrashPhase("LuaScriptInterface::protectedCall / install error handler");
 	int error_index = lua_gettop(L) - nargs;
 	lua_pushcfunction(L, luaErrorHandler);
 	lua_insert(L, error_index);
 
+	setLuaCrashPhase("LuaScriptInterface::protectedCall / executing lua_pcall");
 	int ret = lua_pcall(L, nargs, nresults, error_index);
+	setLuaCrashPhase("LuaScriptInterface::protectedCall / remove error handler");
 	lua_remove(L, error_index);
 	return ret;
 }
@@ -763,6 +818,7 @@ void LuaScriptInterface::reportError(const char* function, std::string_view erro
 
 bool LuaScriptInterface::pushFunction(int32_t functionId)
 {
+	setLuaCrashPhase("LuaScriptInterface::pushFunction / registry lookup");
 	lua_rawgeti(luaState, LUA_REGISTRYINDEX, eventTableRef);
 	if (!Lua::isTable(luaState, -1)) {
 		return false;
@@ -1095,6 +1151,7 @@ void Lua::setItemMetatable(lua_State* L, int32_t index, const Item* item)
 
 void Lua::setCreatureMetatable(lua_State* L, int32_t index, const Creature* creature)
 {
+	setLuaCrashPhase("Lua::setCreatureMetatable / select creature metatable");
 	if (creature->isPlayer()) {
 		luaL_getmetatable(L, "Player");
 	} else if (creature->isMonster()) {
@@ -1106,10 +1163,13 @@ void Lua::setCreatureMetatable(lua_State* L, int32_t index, const Creature* crea
 		LOG_ERROR("[Lua::setCreatureMetatable] Unknown creature type: {}", static_cast<int32_t>(creature->getType()));
 		luaL_getmetatable(L, "Creature");
 	}
+	setLuaCrashPhase("Lua::setCreatureMetatable / lua_setmetatable");
 	lua_setmetatable(L, index - 1);
 
-	new (lua_newuserdatauv(L, sizeof(std::weak_ptr<Creature>), 0)) std::weak_ptr<Creature>(
-	    g_game.getCreatureWeakRef(creature));
+	setLuaCrashPhase("Lua::setCreatureMetatable / allocate weak ownership userdata");
+	new (lua_newuserdatauv(L, sizeof(std::weak_ptr<Creature>), 0))
+	    std::weak_ptr<Creature>(g_game.getCreatureWeakRef(creature));
+	setLuaCrashPhase("Lua::setCreatureMetatable / lua_setiuservalue weak ownership");
 	lua_setiuservalue(L, index - 1, 1);
 }
 
@@ -4438,6 +4498,26 @@ bool LuaEnvironment::initState()
 	}
 
 	luaL_openlibs(luaState);
+
+#if LUA_VERSION_NUM == 505
+	// Lua 5.5.0 shipped with a missing write barrier in luaV_finishset. Fail
+	// fast for an unpatched system library instead of accepting latent heap
+	// corruption. Patched 5.5 builds and later 5.5 maintenance releases pass.
+	constexpr const char* writeBarrierProbe =
+	    "local p={}; p.__newindex=p; collectgarbage(); "
+	    "local c=setmetatable({},p); c.__newindex={x='ok'}; "
+	    "collectgarbage('step'); assert(p.__newindex.x=='ok')";
+	if (luaL_dostring(luaState, writeBarrierProbe) != LUA_OK) {
+		const char* error = lua_tostring(luaState, -1);
+		LOG_ERROR("[LuaEnvironment::initState] Lua 5.5 write-barrier self-test failed: {}",
+		          error ? error : "unknown error");
+		ownedLuaState_.reset();
+		luaState = nullptr;
+		return false;
+	}
+	lua_settop(luaState, 0);
+#endif
+
 	registerFunctions();
 
 	runningEventId = EVENT_ID_USER;

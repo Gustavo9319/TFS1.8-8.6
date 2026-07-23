@@ -491,13 +491,6 @@ std::string Player::getDescription(int32_t lookDistance) const
 			s << " You have no vocation (Level " << level << ").";
 		}
 
-		if (ConfigManager::getBoolean(ConfigManager::RESET_SYSTEM_ENABLED) && reset > 0) {
-			if (lookDistance == -1) {
-				s << " You have " << reset << " reset" << (reset == 1 ? "" : "s") << ".";
-			} else {
-				s << " " << subjectPronoun << " has " << reset << " reset" << (reset == 1 ? "" : "s") << ".";
-			}
-		}
 	} else {
 		s << name;
 		if (!group->access) {
@@ -518,12 +511,13 @@ std::string Player::getDescription(int32_t lookDistance) const
 		} else {
 			s << " has no vocation.";
 		}
-		if (ConfigManager::getBoolean(ConfigManager::RESET_SYSTEM_ENABLED) && reset > 0) {
-			if (lookDistance == -1) {
-				s << " You have " << reset << " reset" << (reset == 1 ? "" : "s") << ".";
-			} else {
-				s << " " << subjectPronoun << " has " << reset << " reset" << (reset == 1 ? "" : "s") << ".";
-			}
+	}
+
+	if (ConfigManager::getBoolean(ConfigManager::RESET_SYSTEM_ENABLED) && reset > 0) {
+		if (lookDistance == -1) {
+			s << " You have " << reset << " reset" << (reset == 1 ? "" : "s") << ".";
+		} else {
+			s << " " << subjectPronoun << " has " << reset << " reset" << (reset == 1 ? "" : "s") << ".";
 		}
 	}
 
@@ -1723,16 +1717,17 @@ std::optional<Player::BestiaryKillResult> Player::takePendingBestiaryKill(uint32
 	return result;
 }
 
-void Player::setStorageValue(const uint32_t key, const std::optional<int64_t> value, const bool isSpawn /* = false*/)
+void Player::setStorageValue(const uint32_t key, const std::optional<int64_t> value)
 {
 	const auto oldValue = getStorageValue(key);
-	Creature::setStorageValue(key, value, isSpawn);
+	Creature::setStorageValue(key, value);
 
-	if (isSpawn || oldValue == getStorageValue(key)) {
+	const auto currentValue = getStorageValue(key);
+	if (oldValue == currentValue) {
 		return;
 	}
 
-	if (value && value.value() != -1) {
+	if (currentValue) {
 		removedStorageKeys.erase(key);
 		modifiedStorageKeys.insert(key);
 	} else {
@@ -1740,6 +1735,14 @@ void Player::setStorageValue(const uint32_t key, const std::optional<int64_t> va
 		removedStorageKeys.insert(key);
 	}
 	storageDirtyKeyRevisions[key] = ++storageDirtyRevision;
+}
+
+void Player::loadStorageValue(uint32_t key, int64_t value)
+{
+	Creature::loadStorageValue(key, value);
+	modifiedStorageKeys.erase(key);
+	removedStorageKeys.erase(key);
+	storageDirtyKeyRevisions.erase(key);
 }
 
 Player::StorageDirtySnapshot Player::getStorageDirtySnapshot() const
@@ -4707,6 +4710,13 @@ Thing* Player::getThing(size_t index) const
 void Player::postAddNotification(Thing* thing, const Cylinder* oldParent, int32_t index,
                                  cylinderlink_t link /*= LINK_OWNER*/)
 {
+	// IOLoginData builds the inventory in a worker thread. The item is already
+	// attached by internalAddThing(), but every notification side effect below
+	// must wait until the player is placed on the dispatcher thread.
+	if (isLoading()) {
+		return;
+	}
+
 	if (link == LINK_OWNER) {
 		// calling movement scripts
 		g_moveEvents->onPlayerEquip(this, thing->getItem(), static_cast<slots_t>(index), false);
@@ -5041,12 +5051,17 @@ void Player::maintainAttackFlow()
 
 uint64_t Player::getGainedExperience(const std::shared_ptr<Creature>& attacker) const
 {
+	return getGainedExperience(attacker, getDamageRatio(attacker));
+}
+
+uint64_t Player::getGainedExperience(const std::shared_ptr<Creature>& attacker, double damageRatio) const
+{
 	if (getBoolean(ConfigManager::EXPERIENCE_FROM_PLAYERS)) {
 		Player* attackerPlayer = attacker ? attacker->getPlayer() : nullptr;
 		if (attackerPlayer && attacker.get() != this && skillLoss &&
 		    std::abs(static_cast<int64_t>(attackerPlayer->getLevel() - level)) <=
 		        getInteger(ConfigManager::EXP_FROM_PLAYERS_LEVEL_RANGE)) {
-			return std::max<uint64_t>(0, std::floor(getLostExperience() * getDamageRatio(attacker) * 0.75));
+			return std::max<uint64_t>(0, std::floor(getLostExperience() * damageRatio * 0.75));
 		}
 	}
 	return 0;
