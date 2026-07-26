@@ -43,8 +43,13 @@ Position NetworkMessage::getPosition()
 
 void NetworkMessage::addString(std::string_view value)
 {
+	if (!canAdd(sizeof(uint16_t))) {
+		return;
+	}
+
 	const auto stringLen = simdutf::latin1_length_from_utf8(value.data(), value.size());
-	if (!canAdd(stringLen + 2) || stringLen > 8192) {
+	if (stringLen > 8192 || !canAdd(stringLen + sizeof(uint16_t))) {
+		add<uint16_t>(0);
 		return;
 	}
 
@@ -56,6 +61,7 @@ void NetworkMessage::addString(std::string_view value)
 	if (writtenLen != stringLen) {
 		info.position = startPosition;
 		info.length = startLength;
+		add<uint16_t>(0);
 		return;
 	}
 

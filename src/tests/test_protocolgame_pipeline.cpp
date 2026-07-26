@@ -36,6 +36,32 @@ TEST_CASE(network_message_copy_preserves_parser_state)
 	CHECK(overrunCopy->getBufferPosition() == original.getBufferPosition());
 }
 
+TEST_CASE(network_message_invalid_latin1_string_keeps_packet_framing)
+{
+	NetworkMessage message;
+	message.addByte(0xB4);
+	message.addByte(0x12);
+	message.addString(std::string("\xF0\x9F\x98\x80", 4));
+
+	CHECK(message.getLength() == 4);
+	CHECK(message.setBufferPosition(0));
+	CHECK(message.getByte() == 0xB4);
+	CHECK(message.getByte() == 0x12);
+	CHECK(message.get<uint16_t>() == 0);
+	CHECK(!message.isOverrun());
+}
+
+TEST_CASE(network_message_oversized_string_keeps_packet_framing)
+{
+	NetworkMessage message;
+	message.addString(std::string(8193, 'x'));
+
+	CHECK(message.getLength() == 2);
+	CHECK(message.setBufferPosition(0));
+	CHECK(message.get<uint16_t>() == 0);
+	CHECK(!message.isOverrun());
+}
+
 TEST_CASE(packet_backlog_limits_copies_and_disconnects_once)
 {
 	tfs::net::PacketBacklog backlog(2);

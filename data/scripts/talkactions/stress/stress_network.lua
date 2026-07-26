@@ -282,6 +282,7 @@ local function runSendTest(player, amount, done)
         function(_, p)
             local msg = NetworkMessage()
             msg:addByte(0xB4)
+            msg:addByte(MSG_BLUE)
             msg:addString("Benchmark")
             msg:sendToPlayer(p)
         end,
