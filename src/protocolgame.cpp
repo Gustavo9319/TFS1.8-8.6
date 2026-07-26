@@ -24,6 +24,7 @@
 #include "logger.h"
 #include "scheduler.h"
 #include "scriptmanager.h"
+#include "spells.h"
 #include "thread_pool.h"
 
 #include <algorithm>
@@ -3361,6 +3362,10 @@ void ProtocolGame::sendStats()
 
 void ProtocolGame::sendBasicData()
 {
+	if (!player || !isAstraClient) {
+		return;
+	}
+
 	NetworkMessage msg;
 	msg.addByte(0x9F);
 
@@ -3373,8 +3378,24 @@ void ProtocolGame::sendBasicData()
 	// prey - OTC client expects 1 byte for prey status when GamePrey feature is enabled
 	msg.addByte(0x00);
 
-	// spells - send known spells count + ids
-	msg.add<uint16_t>(0); // spell count = 0 (protocol 8.60 doesn't use this packet for spells)
+	std::vector<uint16_t> knownSpells;
+	if (g_spells) {
+		for (const auto& entry : g_spells->getInstantSpells()) {
+			const auto& spell = entry.second;
+			if (spell.getId() != 0 && spell.canCast(player.get())) {
+				knownSpells.push_back(spell.getId());
+			}
+		}
+	}
+
+	std::ranges::sort(knownSpells);
+	knownSpells.erase(std::unique(knownSpells.begin(), knownSpells.end()), knownSpells.end());
+
+	msg.add<uint16_t>(static_cast<uint16_t>(knownSpells.size()));
+	for (uint16_t spellId : knownSpells) {
+		msg.add<uint16_t>(spellId);
+	}
+	msg.addByte(player->getVocation()->getMagicShield());
 
 	writeToOutputBuffer(msg);
 }
@@ -4412,7 +4433,7 @@ void ProtocolGame::sendAddCreature(const Creature* creature, const Position& pos
 	sendStats();
 	sendSkills();
 
-	if (isOTC) {
+	if (isAstraClient) {
 		sendBasicData();
 	}
 
@@ -4783,9 +4804,8 @@ void ProtocolGame::sendOutfitWindow()
 
 	const bool monkVocationEnabled = ConfigManager::getBoolean(ConfigManager::MONK_VOCATION_ENABLED);
 	const bool isAstra860 = isAstraClient && getVersion() == 860;
-	auto isHiddenOutfit = [monkVocationEnabled, isAstra860](const Outfit* outfit) {
-		return outfit && ((!monkVocationEnabled && outfit->name == "Monk") ||
-		                  (isAstra860 && !AstraClient::supports860OutfitLookType(outfit->lookType)));
+	auto isHiddenOutfit = [monkVocationEnabled](const Outfit* outfit) {
+		return outfit && !monkVocationEnabled && outfit->name == "Monk";
 	};
 	auto firstVisibleOutfit = [&outfits, &isHiddenOutfit]() -> const Outfit* {
 		for (const Outfit* outfit : outfits) {
@@ -5327,11 +5347,9 @@ void ProtocolGame::AddPlayerSkills(NetworkMessage& msg)
 
 void ProtocolGame::AddOutfit(NetworkMessage& msg, const Outfit_t& outfit)
 {
-	const bool sanitize860Outfits = getVersion() == 860 && (isAstraClient || isOTC);
-	const uint16_t lookType = sanitize860Outfits ? AstraClient::sanitize860OutfitLookType(outfit.lookType) : outfit.lookType;
-	msg.add<uint16_t>(lookType);
+	msg.add<uint16_t>(outfit.lookType);
 
-	if (lookType != 0) {
+	if (outfit.lookType != 0) {
 		msg.addByte(outfit.lookHead);
 		msg.addByte(outfit.lookBody);
 		msg.addByte(outfit.lookLegs);
@@ -5342,7 +5360,7 @@ void ProtocolGame::AddOutfit(NetworkMessage& msg, const Outfit_t& outfit)
 	}
 
 	if (isOTC || getVersion() != 861) {
-		msg.add<uint16_t>(sanitize860Outfits ? AstraClient::sanitize860MountLookType(outfit.lookMount) : outfit.lookMount);
+		msg.add<uint16_t>(outfit.lookMount);
 	}
 }
 

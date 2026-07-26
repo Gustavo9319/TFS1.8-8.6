@@ -1149,9 +1149,18 @@ void Combat::doTargetCombat(Creature* caster, Creature* target, CombatDamage& da
 
 	bool success = false;
 	if (damage.primary.type != COMBAT_MANADRAIN) {
-		if (g_game.combatBlockHit(damage, caster, target, params.blockedByShield, params.blockedByArmor,
-		                          params.itemId != 0, params.ignoreResistances)) {
+		const int32_t perfectShotDamage = damage.perfectShotDamage;
+		damage.perfectShotDamage = 0;
+		const bool fullyBlocked =
+		    g_game.combatBlockHit(damage, caster, target, params.blockedByShield, params.blockedByArmor,
+		                          params.itemId != 0, params.ignoreResistances);
+		const bool perfectShotBypassesBlock =
+		    damage.blockType == BLOCK_DEFENSE || damage.blockType == BLOCK_ARMOR;
+		if (fullyBlocked && (perfectShotDamage == 0 || !perfectShotBypassesBlock)) {
 			return;
+		}
+		if (damage.blockType == BLOCK_NONE || perfectShotBypassesBlock) {
+			damage.primary.value += perfectShotDamage;
 		}
 
 		if (target && target->getPlayer() &&
@@ -1212,10 +1221,10 @@ void Combat::doTargetCombat(Creature* caster, Creature* target, CombatDamage& da
 				int32_t skill = std::max<int32_t>(
 				    0, static_cast<int32_t>(casterPlayer->getSpecialSkill(SPECIALSKILL_CRITICALHITAMOUNT)) +
 				           damage.criticalDamage + savageBonus);
-				if (skill == 0 && chance > 0) {
+				const int32_t roll = uniform_random(1, 10000);
+				if (skill == 0 && lowBlowBonus > 0 && roll > baseChance) {
 					skill = 5000;
 				}
-				const int32_t roll = uniform_random(1, 10000);
 				if (chance > 0 && skill > 0 && roll <= chance) {
 					damage.primary.value += std::round(damage.primary.value * (skill / 10000.));
 					damage.secondary.value += std::round(damage.secondary.value * (skill / 10000.));
@@ -1513,7 +1522,6 @@ void Combat::doAreaCombat(Creature* caster, const Position& position, const Area
 		    0, static_cast<int32_t>(casterPlayer->getSpecialSkill(SPECIALSKILL_CRITICALHITAMOUNT)) +
 		           damage.criticalDamage);
 
-		if (skill == 0 && chance > 0) { skill = 5000; }
 		if (chance > 0 && skill > 0 && uniform_random(1, 10000) <= chance) {
 			criticalPrimary = std::round(damage.primary.value * (skill / 10000.));
 			criticalSecondary = std::round(damage.secondary.value * (skill / 10000.));
