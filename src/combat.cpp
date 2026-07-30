@@ -87,6 +87,34 @@ bool rollMonsterCritical(const std::shared_ptr<Monster>& monster, const CombatDa
 	return chance > 0 && skill > 0 && uniform_random(1, 10000) <= chance;
 }
 
+bool rollFatalHit(const Player* player, const CombatDamage& damage)
+{
+	if (!player || damage.fatal || damage.primary.type == COMBAT_HEALING ||
+	    damage.primary.type == COMBAT_MANADRAIN || damage.origin == ORIGIN_CONDITION) {
+		return false;
+	}
+
+	const Item* weapon = player->getWeapon();
+	if (!weapon || weapon->getTier() == 0) {
+		return false;
+	}
+
+	double fatalChance = weapon->getFatalChance();
+	const Item* boots = player->getInventoryItem(CONST_SLOT_FEET);
+	if (boots && boots->getTier() > 0) {
+		const double ampChance = boots->getMomentumChance() * 0.02;
+		fatalChance *= 1.0 + ampChance;
+	}
+	return fatalChance > 0 && (normal_random(1, 10000) / 100.0) < fatalChance;
+}
+
+void applyFatalDamage(CombatDamage& damage)
+{
+	damage.primary.value += std::round(damage.primary.value * 0.5);
+	damage.secondary.value += std::round(damage.secondary.value * 0.5);
+	damage.fatal = true;
+}
+
 } // namespace
 
 static int32_t getEffectiveMagicLevel(const Player* player, CombatType_t combatType)
@@ -1238,23 +1266,8 @@ void Combat::doTargetCombat(Creature* caster, Creature* target, CombatDamage& da
 				}
 			}
 
-			if (!damage.fatal && damage.primary.type != COMBAT_HEALING && damage.origin != ORIGIN_CONDITION) {
-				Item* weapon = casterPlayer->getWeapon();
-				if (weapon && weapon->getTier() > 0) {
-					double fatalChance = weapon->getFatalChance();
-					Item* boots = casterPlayer->getInventoryItem(CONST_SLOT_FEET);
-					if (boots && boots->getTier() > 0) {
-						double ampChance = boots->getMomentumChance() * 0.02;
-						fatalChance *= (1.0 + ampChance);
-					}
-					if (fatalChance > 0 && (normal_random(1, 10000) / 100.0) < fatalChance) {
-						int32_t fatalPrimary = std::round(damage.primary.value * 0.5);
-						int32_t fatalSecondary = std::round(damage.secondary.value * 0.5);
-						damage.primary.value += fatalPrimary;
-						damage.secondary.value += fatalSecondary;
-						damage.fatal = true;
-					}
-				}
+			if (rollFatalHit(casterPlayer, damage)) {
+				applyFatalDamage(damage);
 			}
 		} else if (auto casterMonster = lockMonster(caster)) {
 			int32_t skill = 0;
@@ -1536,6 +1549,7 @@ void Combat::doAreaCombat(Creature* caster, const Position& position, const Area
 		}
 	}
 	finishPhase(PerformanceMetric::CombatAreaPrepareDamage, &AreaCombatMetricsSample::prepareDamageNanoseconds);
+	const bool fatalHit = rollFatalHit(casterPlayer, damage);
 
 	int32_t maxX = 0;
 	int32_t maxY = 0;
@@ -1675,6 +1689,9 @@ void Combat::doAreaCombat(Creature* caster, const Position& position, const Area
 			if (fullyBlocked) {
 				continue;
 			}
+			if (fatalHit) {
+				applyFatalDamage(damageCopy);
+			}
 			if (params.resetDamageMultiplier >= 0.0f) {
 				damageCopy.spellResetMultiplier = params.resetDamageMultiplier;
 			}
@@ -1694,6 +1711,12 @@ void Combat::doAreaCombat(Creature* caster, const Position& position, const Area
 		if (success) {
 			if (metrics) {
 				++metrics->appliedTargets;
+			}
+			if (damageCopy.fatal) {
+				SpectatorVec fatalSpectators;
+				g_game.map.getSpectators(fatalSpectators, creature->getPosition(), true, true);
+				InstanceUtils::sendMagicEffectToInstance(
+				    fatalSpectators, creature->getPosition(), CONST_ME_FATAL, creature->getInstanceID());
 			}
 			if (casterPlayer && wpEnabled && damageCopy.primary.type != COMBAT_HEALING && damageCopy.primary.type != COMBAT_MANADRAIN) {
 				casterPlayer->weaponProficiency().applyOn(WeaponProficiencyHealth_t::LIFE, WeaponProficiencyGain_t::HIT);
