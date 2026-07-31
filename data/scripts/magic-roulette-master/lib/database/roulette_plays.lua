@@ -23,7 +23,7 @@ db.query([[
 ]])
 
 function DatabaseRoulettePlays:create(uuid, playerId, reward) 
-	db.query(('INSERT INTO roulette_plays (player_id, uuid, reward_id, reward_count) VALUES (%d, \'%s\', %d, %d)'):format(
+	db.query(('INSERT INTO roulette_plays (player_id, uuid, reward_id, reward_count) VALUES (%d, %s, %d, %d)'):format(
 		playerId,
 		db.escapeString(uuid),
 		reward.id,
