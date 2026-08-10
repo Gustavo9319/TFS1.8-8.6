@@ -19,6 +19,7 @@
 #include "outputmessage.h"
 #include "player.h"
 #include "protocolgame.h"
+#include "protocollogin.h"
 #include "imbuement.h"
 #include "familiar.h"
 #include "logger.h"
@@ -907,10 +908,11 @@ void ProtocolGame::finishLogin(uint32_t reservedGuid, uint32_t accountId, bool l
 	g_game.releaseLogin(reservedGuid);
 }
 
-void ProtocolGame::spectate(const std::string& name, const std::string& password)
+void ProtocolGame::spectate(const std::string& name, const std::string& password, uint32_t clientIP)
 {
 	//dispatcher thread
 	if (isConnectionExpired()) {
+		LoginAttemptLimiter::getInstance().releaseReservation(clientIP, "");
 		return;
 	}
 
@@ -927,19 +929,27 @@ void ProtocolGame::spectate(const std::string& name, const std::string& password
 	auto foundPlayer = g_game.getPlayerByName(name);
 	auto castClient = foundPlayer ? foundPlayer->client : nullptr;
 	if (!foundPlayer || !castClient || !castClient->isBroadcasting()) {
+		LoginAttemptLimiter::getInstance().releaseReservation(clientIP, "");
 		disconnectClient("That cast is not available anymore.");
 		return;
 	}
 
 	if (!castClient->password().empty() && asLowerCaseString(castClient->password()) != asLowerCaseString(password)) {
+		// A cast password is a credential like any other, so a rejected guess has to
+		// count. It is recorded with an empty account name, which registers against
+		// the per-IP spray guard only - a cast has no account dimension, and keying
+		// it by the streamer's name would let anyone lock a streamer's viewers out.
+		recordRejectedCastPassword(clientIP);
 		disconnectClient("Wrong password for that cast.");
 		return;
 	}
 
 	if (castClient->isBanned(getIP())) {
+		LoginAttemptLimiter::getInstance().releaseReservation(clientIP, "");
 		disconnectClient("You are banned on this cast.");
 		return;
 	}
+	LoginAttemptLimiter::getInstance().commitSuccess(clientIP, "");
 
 	player = foundPlayer;
 	isSpectator = true;
@@ -959,6 +969,11 @@ void ProtocolGame::spectate(const std::string& name, const std::string& password
 	acceptPackets = true;
 	sendWelcomeMessage();
 
+}
+
+void ProtocolGame::recordRejectedCastPassword(uint32_t ip)
+{
+	LoginAttemptLimiter::getInstance().commitFailure(ip, "");
 }
 
 void ProtocolGame::connect(uint32_t playerId, OperatingSystem_t operatingSystem)
@@ -1201,18 +1216,39 @@ void ProtocolGame::onRecvFirstMessage(NetworkMessage& msg)
 		return;
 	}
 
-	// Authenticate and resolve account/character IDs
-	bool cast = false;
-	auto authPair = IOLoginData::gameworldAuthentication(accountName, password, characterName, cast);
-	if (cast) {
-		g_dispatcher.addTask([thisPtr = getThis(), name = std::string(characterName), pass = std::string(password)]() { thisPtr->spectate(name, pass); });
+	// Brute force protection. The login server applies this limiter on its own
+	// port, but the game world validates the same account name and password
+	// independently, so without the check here an attacker can skip the login
+	// server entirely and guess credentials at connection speed.
+	//
+	// The account name is passed so failures are counted per account. A cast
+	// (spectator) request carries no account name and is authenticated against the
+	// cast password instead, so it only meets the per-IP spray guard - watching a
+	// stream keeps working while one account on the same address is locked out.
+	const uint32_t clientIP = getIP();
+	if (!LoginAttemptLimiter::getInstance().reserveLogin(clientIP, accountName)) {
+		disconnectClient("Too many failed login attempts. Please try again later.");
 		return;
 	}
-	uint32_t accountId = authPair.first;
-	uint32_t characterId = authPair.second;
 
-	if (accountId == 0 || characterId == 0) {
-		// auth failed, will disconnect below
+	// Authenticate and resolve account/character IDs
+	const auto authentication = IOLoginData::gameworldAuthentication(accountName, password, characterName);
+	if (authentication.cast) {
+		g_dispatcher.addTask([thisPtr = getThis(), name = std::string(characterName), pass = std::string(password),
+		                      clientIP]() { thisPtr->spectate(name, pass, clientIP); });
+		return;
+	}
+	const uint32_t accountId = authentication.accountId;
+	const uint32_t characterId = authentication.characterId;
+
+	if (authentication.status == IOLoginData::AuthenticationResult::Rejected) {
+		LoginAttemptLimiter::getInstance().commitFailure(clientIP, accountName);
+	} else if (authentication.status == IOLoginData::AuthenticationResult::Success) {
+		LoginAttemptLimiter::getInstance().commitSuccess(clientIP, accountName);
+	} else {
+		LoginAttemptLimiter::getInstance().releaseReservation(clientIP, accountName);
+		disconnectClient("The login service is temporarily unavailable. Please try again later.");
+		return;
 	}
 
 	BanInfo banInfo;
