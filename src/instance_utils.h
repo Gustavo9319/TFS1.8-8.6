@@ -26,7 +26,22 @@ inline bool canSeeItemInInstance(uint32_t viewerInstanceId, const Item *item)
         return true;
     }
 
-    return itemInstanceId == 0 && item->isLoadedFromMap();
+    // Shared map tiles remain visible across instances.
+    if (itemInstanceId == 0 && item->isLoadedFromMap()) {
+        return true;
+    }
+
+    // Inventory/container items are forced to instance 0 while carried by a
+    // creature (see getDestinationInstanceId). Allow their owner to look/use
+    // them even while standing inside a non-zero instance.
+    if (itemInstanceId == 0) {
+        const Cylinder* topParent = item->getTopParent();
+        if (topParent && topParent->getCreature()) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 inline bool isPlayerInSameInstance(const Creature* player,

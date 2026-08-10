@@ -3761,13 +3761,16 @@ void Game::playerInspectItem(uint32_t playerId, const Position& pos)
 		player->sendCancelMessage(RETURNVALUE_NOTPOSSIBLE);
 		return;
 	}
-	if (!InstanceUtils::canSeeItemInInstance(player->getInstanceID(), item)) {
+
+	const bool isInventoryOrContainer = pos.x == 0xFFFF;
+	if (!isInventoryOrContainer &&
+	    !InstanceUtils::canSeeItemInInstance(player->getInstanceID(), item)) {
 		player->sendCancelMessage(RETURNVALUE_NOTPOSSIBLE);
 		return;
 	}
 
 	const Position thingPos = thing->getPosition();
-	if (!player->canSee(thingPos)) {
+	if (!isInventoryOrContainer && !player->canSee(thingPos)) {
 		player->sendCancelMessage(RETURNVALUE_NOTPOSSIBLE);
 		return;
 	}
@@ -5234,14 +5237,18 @@ void Game::playerLookAt(uint32_t playerId, const Position& pos, uint8_t stackPos
 		return;
 	}
 
+	const bool isInventoryOrContainer = pos.x == 0xFFFF;
 	if (const Item* item = thing->getItem();
-	    item && !InstanceUtils::canSeeItemInInstance(player->getInstanceID(), item)) {
+	    item && !isInventoryOrContainer &&
+	    !InstanceUtils::canSeeItemInInstance(player->getInstanceID(), item)) {
 		player->sendCancelMessage(RETURNVALUE_NOTPOSSIBLE);
 		return;
 	}
 
 	Position thingPos = thing->getPosition();
-	if (!player->canSee(thingPos)) {
+	// Inventory/container looks use virtual positions; skip viewport checks so
+	// a missing tile parent cannot block looking at your own items.
+	if (!isInventoryOrContainer && !player->canSee(thingPos)) {
 		player->sendCancelMessage(RETURNVALUE_NOTPOSSIBLE);
 		return;
 	}
@@ -5250,9 +5257,14 @@ void Game::playerLookAt(uint32_t playerId, const Position& pos, uint8_t stackPos
 
 	int32_t lookDistance = -1;
 	if (thing != player) {
-		lookDistance = std::max(playerPos.getDistanceX(thingPos), playerPos.getDistanceY(thingPos));
-		if (playerPos.z != thingPos.z) {
-			lookDistance += 15;
+		if (isInventoryOrContainer) {
+			// Own inventory/container items are always inspected up close.
+			lookDistance = 0;
+		} else {
+			lookDistance = std::max(playerPos.getDistanceX(thingPos), playerPos.getDistanceY(thingPos));
+			if (playerPos.z != thingPos.z) {
+				lookDistance += 15;
+			}
 		}
 	}
 

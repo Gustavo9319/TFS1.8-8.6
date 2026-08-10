@@ -190,57 +190,6 @@ soulpitSystemEnabled = false
 -- Requires weeklyTasksEnabled or proper source of soulseals.
 soulsealsSystemEnabled = false
 
--- Stress test: runs reactor stress tests
--- For use test only says: /stress_reactor
-stressTest = false
-stressTestCount = 10000
-stressTestThreads = 8
-stressTestSend = true
-stressTestSendCount = 10000
-stressTestSchedule = true
-stressTestScheduleCount = 10000
-stressTestStaggered = true
-stressTestStaggeredCount = 10000
-stressTestMixed = true
-stressTestMixedCount = 10000
-stressTestCancel = true
-stressTestCancelCount = 10000
-stressTestConcurrentPush = true
-stressTestConcurrentPushCount = 10000
-stressTestConcurrentPushThreads = 8
-stressTestConcurrentSchedule = true
-stressTestConcurrentScheduleCount = 10000
-stressTestConcurrentScheduleThreads = 8
-stressTestHeapOrder = true
-stressTestHeapOrderCount = 5000
-stressTestUniqueIds = true
-stressTestUniqueIdsCount = 10000
-stressTestUniqueIdsThreads = 8
-stressTestMoveOnly = true
-stressTestMoveOnlyCount = 1000
-stressTestExpiration = true
-stressTestExpirationCount = 10000
-stressTestBurst = true
-stressTestBurstCount = 10000
-stressTestReentrancy = true
-stressTestReentrancyCount = 1000
-stressTestShutdownPending = true
-stressTestShutdownPendingCount = 10000
-stressTestCancelExternal = true
-stressTestCancelExternalCount = 10000
-stressTestCancelExternalThreads = 8
-stressTestException = true
-stressTestExceptionCount = 10000
-stressTestBenchmark = true
-stressTestInspection = true
-stressTestInspectionCount = 100
-stressTestMixedDelays = true
-stressTestMixedDelaysCount = 10000
-stressTestLeak = true
-stressTestLeakCount = 10000
-stressTestShutdownSend = true
-stressTestShutdownSendCount = 10000
-
 -- Static item augment defaults. Item-specific values can override these in items.xml.
 augmentIncreasedDamagePercent = 5
 augmentPowerfulImpactPercent = 7
@@ -584,3 +533,54 @@ combatChainSkillFormulaWandsAndRods = 1.0
 -- Enabled by default for Knights, Elite Knights, Monks, and Exalted Monks.
 -- Turn on/off per player via !cleave talkaction.
 -- Cleave percentage and fist percentage are configured in data/server_config.lua (cleaveDefaultPercent / cleaveFistPercent)
+
+-- Stress test: runs reactor stress tests
+-- For use test only says: /stress_reactor
+stressTest = false
+stressTestCount = 10000
+stressTestThreads = 8
+stressTestSend = true
+stressTestSendCount = 10000
+stressTestSchedule = true
+stressTestScheduleCount = 10000
+stressTestStaggered = true
+stressTestStaggeredCount = 10000
+stressTestMixed = true
+stressTestMixedCount = 10000
+stressTestCancel = true
+stressTestCancelCount = 10000
+stressTestConcurrentPush = true
+stressTestConcurrentPushCount = 10000
+stressTestConcurrentPushThreads = 8
+stressTestConcurrentSchedule = true
+stressTestConcurrentScheduleCount = 10000
+stressTestConcurrentScheduleThreads = 8
+stressTestHeapOrder = true
+stressTestHeapOrderCount = 5000
+stressTestUniqueIds = true
+stressTestUniqueIdsCount = 10000
+stressTestUniqueIdsThreads = 8
+stressTestMoveOnly = true
+stressTestMoveOnlyCount = 1000
+stressTestExpiration = true
+stressTestExpirationCount = 10000
+stressTestBurst = true
+stressTestBurstCount = 10000
+stressTestReentrancy = true
+stressTestReentrancyCount = 1000
+stressTestShutdownPending = true
+stressTestShutdownPendingCount = 10000
+stressTestCancelExternal = true
+stressTestCancelExternalCount = 10000
+stressTestCancelExternalThreads = 8
+stressTestException = true
+stressTestExceptionCount = 10000
+stressTestBenchmark = true
+stressTestInspection = true
+stressTestInspectionCount = 100
+stressTestMixedDelays = true
+stressTestMixedDelaysCount = 10000
+stressTestLeak = true
+stressTestLeakCount = 10000
+stressTestShutdownSend = true
+stressTestShutdownSendCount = 10000
