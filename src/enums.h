@@ -774,12 +774,16 @@ struct CombatDamage
 	} primary = {}, secondary = {};
 
 	CombatOrigin origin = ORIGIN_NONE;
+	CombatOrigin initialOrigin = ORIGIN_NONE;
 	BlockType_t blockType = BLOCK_NONE;
 	bool critical = false;
 	bool leeched = false;
 	bool fatal = false;
 	bool dodge = false;
 	bool preyApplied = false;
+	bool initialOriginCaptured = false;
+	bool equipmentDamageBonusApplied = false;
+	bool equipmentDamageReductionApplied = false;
 	int32_t criticalDamage = 0;
 	int32_t criticalChance = 0;
 	int32_t perfectShotDamage = 0;
