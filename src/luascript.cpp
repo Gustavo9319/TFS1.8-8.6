@@ -245,8 +245,6 @@ void pushKVValue(lua_State* L, const ValueWrapper& value, int32_t depth = 0)
 }
 } // namespace
 
-ScriptEnvironment::DBResultMap ScriptEnvironment::tempResults;
-uint32_t ScriptEnvironment::lastResultId = 0;
 
 std::multimap<ScriptEnvironment*, std::shared_ptr<Item>> ScriptEnvironment::tempItems;
 
@@ -522,8 +520,14 @@ std::string_view LuaScriptInterface::getErrorDesc(LuaErrorCode code)
 	}
 }
 
-ScriptEnvironment LuaScriptInterface::scriptEnv[16];
+ScriptEnvironment LuaScriptInterface::scriptEnv[LuaScriptInterface::SCRIPT_ENV_COUNT];
 int32_t LuaScriptInterface::scriptEnvIndex = -1;
+
+void LuaScriptInterface::reportScriptEnvOutOfBounds(const char* function, int32_t index)
+{
+	LOG_ERROR("[{}] scriptEnvIndex out of bounds: {} (valid range 0..{})", function, index,
+	          SCRIPT_ENV_COUNT - 1);
+}
 
 LuaScriptInterface::LuaScriptInterface(std::string_view interfaceName) : interfaceName{interfaceName} {}
 
@@ -535,7 +539,14 @@ LuaScriptInterface::~LuaScriptInterface()
 
 void LuaScriptInterface::resetScriptEnv()
 {
-	assert(scriptEnvIndex >= 0);
+	assert(scriptEnvIndex >= 0 && scriptEnvIndex < SCRIPT_ENV_COUNT);
+	// The upper bound was previously unchecked, so a stale index would index past
+	// the end of the array and write there. Bail out instead of corrupting memory.
+	if (scriptEnvIndex < 0 || scriptEnvIndex >= SCRIPT_ENV_COUNT) {
+		reportScriptEnvOutOfBounds(__func__, scriptEnvIndex);
+		return;
+	}
+
 	// Rollback any open transaction leaked by the script that just ended
 	if (Database::getInstance().isInTransaction()) {
 		Database::getInstance().rollback();
@@ -3986,6 +3997,24 @@ int LuaScriptInterface::luaAddEvent(lua_State* L)
 	eventDesc.eventId = g_scheduler.addEvent(createSchedulerTaskWithStats(
 	    delay, [timerEventId]() { g_luaEnvironment.executeTimerEvent(timerEventId); }, "Lua timer callback", eventOrigin));
 
+	if (eventDesc.eventId == 0) {
+		// The scheduler refused the event: it is not running, or the reactor's
+		// scheduleInbox overflowed and dropped the task. executeTimerEvent() will
+		// therefore never run, so nothing would ever release these registry refs.
+		// Drop them here instead of registering an event that can never fire —
+		// otherwise the refs, and every game object the userdata keeps alive,
+		// leak until shutdown.
+		luaL_unref(L, LUA_REGISTRYINDEX, eventDesc.function);
+		for (auto parameter : eventDesc.parameters) {
+			luaL_unref(L, LUA_REGISTRYINDEX, parameter);
+		}
+		LOG_ERROR("[Error - LuaScriptInterface::luaAddEvent] Scheduler rejected the event; "
+		          "the callback will not run (origin: {})",
+		          eventOrigin);
+		lua_pushnil(L);
+		return 1;
+	}
+
 	g_luaEnvironment.timerEvents.emplace(lastTimerEventId, std::move(eventDesc));
 	lua_pushinteger(L, lastTimerEventId++);
 	return 1;
@@ -4178,8 +4207,10 @@ int LuaScriptInterface::luaDatabaseAsyncExecute(lua_State* L)
 		return pushAsyncTransactionError(L, "db.query()");
 	}
 	std::function<void(DBResult_ptr, bool, uint64_t)> callback;
+	int32_t callbackRef = LUA_NOREF;
 	if (lua_gettop(L) > 1) {
 		int32_t ref = luaL_ref(L, LUA_REGISTRYINDEX);
+		callbackRef = ref;
 		auto scriptId = getScriptEnv()->getScriptId();
 		callback = [ref, scriptId](DBResult_ptr, bool success, uint64_t affectedRows) {
 			lua_State* luaState = g_luaEnvironment.getLuaState();
@@ -4198,14 +4229,20 @@ int LuaScriptInterface::luaDatabaseAsyncExecute(lua_State* L)
 			finishAsyncDatabaseCallback(luaState, ref, scriptId, 2);
 		};
 	}
-	g_databaseTasks.addTask(Lua::getString(L, -1), callback);
+
+	// The worker is not running, so the callback that owns this reference will never
+	// run. Release it here or it — and everything the referenced closure keeps alive —
+	// stays in the registry until shutdown.
+	if (!g_databaseTasks.addTask(Lua::getString(L, -1), callback) && callbackRef != LUA_NOREF) {
+		luaL_unref(L, LUA_REGISTRYINDEX, callbackRef);
+	}
 	return 0;
 }
 
 int LuaScriptInterface::luaDatabaseStoreQuery(lua_State* L)
 {
 	if (DBResult_ptr res = Database::getInstance().storeQuery(Lua::getString(L, -1))) {
-		lua_pushinteger(L, ScriptEnvironment::addResult(res));
+		lua_pushinteger(L, getScriptEnv()->addResult(res));
 	} else {
 		Lua::pushBoolean(L, false);
 	}
@@ -4218,8 +4255,10 @@ int LuaScriptInterface::luaDatabaseAsyncStoreQuery(lua_State* L)
 		return pushAsyncTransactionError(L, "db.storeQuery()");
 	}
 	std::function<void(DBResult_ptr, bool, uint64_t)> callback;
+	int32_t callbackRef = LUA_NOREF;
 	if (lua_gettop(L) > 1) {
 		int32_t ref = luaL_ref(L, LUA_REGISTRYINDEX);
+		callbackRef = ref;
 		auto scriptId = getScriptEnv()->getScriptId();
 		callback = [ref, scriptId](DBResult_ptr result, bool, uint64_t affectedRows) {
 			lua_State* luaState = g_luaEnvironment.getLuaState();
@@ -4234,7 +4273,7 @@ int LuaScriptInterface::luaDatabaseAsyncStoreQuery(lua_State* L)
 
 			lua_rawgeti(luaState, LUA_REGISTRYINDEX, ref);
 			if (result) {
-				lua_pushinteger(luaState, ScriptEnvironment::addResult(result));
+				lua_pushinteger(luaState, LuaScriptInterface::getScriptEnv()->addResult(result));
 				lua_pushinteger(luaState, affectedRows);
 			} else {
 				Lua::pushBoolean(luaState, false);
@@ -4243,7 +4282,11 @@ int LuaScriptInterface::luaDatabaseAsyncStoreQuery(lua_State* L)
 			finishAsyncDatabaseCallback(luaState, ref, scriptId, 2);
 		};
 	}
-	g_databaseTasks.addTask(Lua::getString(L, -1), callback, true);
+	// See luaDatabaseAsyncExecute: a rejected task means the callback never runs, so
+	// the registry reference it would have released has to be dropped here.
+	if (!g_databaseTasks.addTask(Lua::getString(L, -1), callback, true) && callbackRef != LUA_NOREF) {
+		luaL_unref(L, LUA_REGISTRYINDEX, callbackRef);
+	}
 	return 0;
 }
 
@@ -4346,7 +4389,7 @@ const luaL_Reg LuaScriptInterface::luaResultTable[] = {
 
 int LuaScriptInterface::luaResultGetNumber(lua_State* L)
 {
-	DBResult_ptr res = ScriptEnvironment::getResultByID(Lua::getInteger<uint32_t>(L, 1));
+	DBResult_ptr res = getScriptEnv()->getResultByID(Lua::getInteger<uint32_t>(L, 1));
 	if (!res) {
 		Lua::pushBoolean(L, false);
 		return 1;
@@ -4359,7 +4402,7 @@ int LuaScriptInterface::luaResultGetNumber(lua_State* L)
 
 int LuaScriptInterface::luaResultGetString(lua_State* L)
 {
-	DBResult_ptr res = ScriptEnvironment::getResultByID(Lua::getInteger<uint32_t>(L, 1));
+	DBResult_ptr res = getScriptEnv()->getResultByID(Lua::getInteger<uint32_t>(L, 1));
 	if (!res) {
 		Lua::pushBoolean(L, false);
 		return 1;
@@ -4372,7 +4415,7 @@ int LuaScriptInterface::luaResultGetString(lua_State* L)
 
 int LuaScriptInterface::luaResultGetStream(lua_State* L)
 {
-	DBResult_ptr res = ScriptEnvironment::getResultByID(Lua::getInteger<uint32_t>(L, 1));
+	DBResult_ptr res = getScriptEnv()->getResultByID(Lua::getInteger<uint32_t>(L, 1));
 	if (!res) {
 		Lua::pushBoolean(L, false);
 		return 1;
@@ -4386,7 +4429,7 @@ int LuaScriptInterface::luaResultGetStream(lua_State* L)
 
 int LuaScriptInterface::luaResultNext(lua_State* L)
 {
-	DBResult_ptr res = ScriptEnvironment::getResultByID(Lua::getInteger<uint32_t>(L, -1));
+	DBResult_ptr res = getScriptEnv()->getResultByID(Lua::getInteger<uint32_t>(L, -1));
 	if (!res) {
 		Lua::pushBoolean(L, false);
 		return 1;
@@ -4398,7 +4441,7 @@ int LuaScriptInterface::luaResultNext(lua_State* L)
 
 int LuaScriptInterface::luaResultFree(lua_State* L)
 {
-	Lua::pushBoolean(L, ScriptEnvironment::removeResult(Lua::getInteger<uint32_t>(L, -1)));
+	Lua::pushBoolean(L, getScriptEnv()->removeResult(Lua::getInteger<uint32_t>(L, -1)));
 	return 1;
 }
 
@@ -4656,6 +4699,11 @@ void LuaEnvironment::executeTimerEvent(uint32_t eventIndex)
 	LuaTimerEventDesc timerEventDesc = std::move(timerEvents[eventIndex]);
 	timerEvents.erase(eventIndex);
 
+	// Everything below pushes onto the shared Lua stack. Only callVoidFunction()
+	// unwinds those pushes, so remember where the stack started and restore it on
+	// any path that does not reach the call.
+	const int stackBase = lua_gettop(luaState);
+
 	// push function
 	lua_rawgeti(luaState, LUA_REGISTRYINDEX, timerEventDesc.function);
 
@@ -4742,6 +4790,10 @@ void LuaEnvironment::executeTimerEvent(uint32_t eventIndex)
 		callVoidFunction(timerEventDesc.parameters.size());
 	} else {
 		LOG_ERROR("[Error - LuaScriptInterface::executeTimerEvent] Call stack overflow");
+		// The function and its parameters are already on the stack but nothing will
+		// consume them now, so drop them here. Without this every timer event that
+		// fails to reserve leaks 1+N stack slots for the lifetime of the state.
+		lua_settop(luaState, stackBase);
 	}
 
 	// free resources

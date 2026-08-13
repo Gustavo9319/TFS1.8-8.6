@@ -9,6 +9,19 @@
 inline constexpr int32_t CONNECTION_WRITE_TIMEOUT = 30;
 inline constexpr int32_t CONNECTION_READ_TIMEOUT = 30;
 
+// Upper bound on writes queued for a single connection.
+//
+// OutputMessage embeds its NETWORKMESSAGE_MAXSIZE buffer inline, so every queued
+// message costs ~64 KB of real memory regardless of how few bytes it carries. An
+// unbounded queue therefore lets one peer that stops reading (TCP zero window,
+// while keeping the socket open) pin memory without limit as the server keeps
+// producing updates for it.
+//
+// 128 messages caps that at roughly 8 MB per connection, which is far above any
+// legitimate burst — a full login sends a few dozen — so hitting it means the
+// peer is dead or hostile and the connection should go.
+inline constexpr size_t MAX_PENDING_WRITE_MESSAGES = 128;
+
 class Protocol;
 using Protocol_ptr = std::shared_ptr<Protocol>;
 class OutputMessage;
@@ -91,11 +104,17 @@ private:
 
 	void closeSocket();
 	void closeLocked(bool force);
-	void internalSend(const OutputMessage_ptr& msg);
+	void internalSend(OutputMessage_ptr msg);
 	uint32_t getIPLocked();
 
 	asio::ip::tcp::socket& getSocket() { return socket; }
 	friend class ServicePort;
+
+	// Test seam. The write-lifetime regression tests need a genuinely connected
+	// socket and direct sight of messageQueue to reproduce "async write pending while
+	// the queue is emptied"; nothing else can observe that state. Declaration only —
+	// the type is defined in src/tests and never exists in the server binary.
+	friend struct ConnectionTestAccess;
 
 	NetworkMessage msg;
 

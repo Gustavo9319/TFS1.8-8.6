@@ -53,28 +53,39 @@ void ConnectionManager::releaseConnection(const Connection_ptr& connection)
 	g_performanceMetrics.recordNetworkConnectionCount(connections.size());
 }
 
+// Both bulk operations below touch per-connection state, which belongs to
+// connectionLock. Connection::closeLocked() already takes connectionLock and
+// then connectionManagerLock (via releaseConnection), so acquiring them in the
+// opposite order here would deadlock. Snapshot the set under the manager lock,
+// release it, then lock each connection on its own — the two locks are never
+// held at the same time.
 void ConnectionManager::closeAll()
 {
-	std::scoped_lock lockClass(connectionManagerLock);
-
-	for (const auto& connection : connections) {
-		try {
-			asio::error_code error;
-			connection->socket.shutdown(asio::ip::tcp::socket::shutdown_both, error);
-			connection->socket.close(error);
-		} catch (std::system_error&) {
-		}
+	std::vector<Connection_ptr> openConnections;
+	{
+		std::scoped_lock lockClass(connectionManagerLock);
+		openConnections.assign(connections.begin(), connections.end());
+		connections.clear();
+		ipConnectionCount.clear();
+		g_performanceMetrics.recordNetworkConnectionCount(0);
 	}
-	connections.clear();
-	ipConnectionCount.clear();
-	g_performanceMetrics.recordNetworkConnectionCount(0);
+
+	for (const auto& connection : openConnections) {
+		std::scoped_lock lock(connection->connectionLock);
+		connection->closeSocket();
+	}
 }
 
 void ConnectionManager::releaseAllProtocols()
 {
-	std::scoped_lock lockClass(connectionManagerLock);
+	std::vector<Connection_ptr> openConnections;
+	{
+		std::scoped_lock lockClass(connectionManagerLock);
+		openConnections.assign(connections.begin(), connections.end());
+	}
 
-	for (const auto& connection : connections) {
+	for (const auto& connection : openConnections) {
+		std::scoped_lock lock(connection->connectionLock);
 		if (connection->protocol) {
 			connection->protocol->release();
 			connection->protocol.reset();
@@ -168,7 +179,13 @@ Connection::~Connection() { closeSocket(); }
 
 void Connection::accept(Protocol_ptr protocol)
 {
-	this->protocol = protocol;
+	// Every other read of this->protocol is under connectionLock; releaseAllProtocols()
+	// can reset it from another thread at any point. Publishing it unlocked here was
+	// the one gap in that discipline.
+	{
+		std::scoped_lock lockClass(connectionLock);
+		this->protocol = protocol;
+	}
 	g_dispatcher.addTask([protocol]() { protocol->onConnect(); });
 
 	accept();
@@ -319,6 +336,19 @@ void Connection::send(const OutputMessage_ptr& msg)
 		return;
 	}
 
+	if (messageQueue.size() >= MAX_PENDING_WRITE_MESSAGES) {
+		LOG_NETWORK(fmt::format("{} disconnected for exceeding the pending write limit ({} messages).",
+		                        convertIPToString(getIPLocked()), MAX_PENDING_WRITE_MESSAGES));
+		// Deliberately does NOT clear messageQueue. The front message may be the
+		// buffer a pending asio::async_write() is reading from right now; dropping
+		// the queue's reference here could free it under Asio. closeLocked() cancels
+		// the socket, which completes that write with operation_aborted, and
+		// onWriteOperation() then drains the queue from the completion side where
+		// no write is in flight. See the ownership note in internalSend().
+		closeLocked(FORCE_CLOSE);
+		return;
+	}
+
 	bool noPendingWrite = messageQueue.empty();
 	messageQueue.emplace_back(msg);
 	if (noPendingWrite) {
@@ -327,14 +357,28 @@ void Connection::send(const OutputMessage_ptr& msg)
 			                  [thisPtr = shared_from_this(), msg] { thisPtr->internalSend(msg); });
 		} catch (const std::system_error& e) {
 			LOG_NETWORK(fmt::format("Error - Connection::send: {}", e.what()));
-			messageQueue.clear();
+			// Same rule as above: never drop queued messages from the producer side.
 			closeLocked(FORCE_CLOSE);
 		}
 	}
 }
 
-void Connection::internalSend(const OutputMessage_ptr& msg)
+// Takes the message by value on purpose. Callers pass messageQueue.front(), so a
+// reference parameter would alias a deque element that this function's own error
+// paths can erase, leaving msg dangling before async_write() reads it.
+void Connection::internalSend(OutputMessage_ptr msg)
 {
+	std::scoped_lock lockClass(connectionLock);
+
+	// releaseAllProtocols() clears protocol during shutdown, and this runs on the
+	// strand, so the pointer can legitimately be gone by the time a queued send
+	// gets here. Nothing can serialise the message without a protocol; tear the
+	// connection down instead of dereferencing null.
+	if (!protocol) {
+		closeLocked(FORCE_CLOSE);
+		return;
+	}
+
 	protocol->onSendMessage(msg);
 	try {
 		writeTimer.expires_after(std::chrono::seconds(CONNECTION_WRITE_TIMEOUT));
@@ -343,14 +387,18 @@ void Connection::internalSend(const OutputMessage_ptr& msg)
 			    Connection::handleTimeout(thisPtr, error);
 		    });
 
+		// The completion handler captures msg so the OutputMessage — and the inline
+		// NETWORKMESSAGE_MAXSIZE buffer handed to asio::buffer() below — stays alive
+		// for the whole write no matter what happens to messageQueue meanwhile. The
+		// queue is a scheduling structure, not the owner of the in-flight buffer.
 		asio::async_write(
 		    socket, asio::buffer(msg->getOutputBuffer(), msg->getLength()),
-		    [thisPtr = shared_from_this()](const asio::error_code& error, auto /*bytes_transferred*/) {
+		    [thisPtr = shared_from_this(), msg](const asio::error_code& error, auto /*bytes_transferred*/) {
 			    thisPtr->onWriteOperation(error);
 		    });
 	} catch (std::system_error& e) {
 		LOG_NETWORK(fmt::format("Error - Connection::internalSend: {}", e.what()));
-		close(FORCE_CLOSE);
+		closeLocked(FORCE_CLOSE);
 	}
 }
 
@@ -381,8 +429,17 @@ void Connection::onWriteOperation(const asio::error_code& error)
 {
 	std::scoped_lock lockClass(connectionLock);
 	writeTimer.cancel();
-	messageQueue.pop_front();
 
+	// This completion owns the message it wrote, so the queue is allowed to be empty
+	// here — a close path may have drained it while the write was still in flight.
+	// pop_front() on an empty deque is undefined behaviour, so check first.
+	if (!messageQueue.empty()) {
+		messageQueue.pop_front();
+	}
+
+	// Clearing the queue is only safe from this side: reaching onWriteOperation()
+	// means the write that owned the front message has finished, so no buffer handed
+	// to Asio is still in use. Producer-side paths must never do this.
 	if (error) {
 		messageQueue.clear();
 		closeLocked(FORCE_CLOSE);
@@ -390,8 +447,21 @@ void Connection::onWriteOperation(const asio::error_code& error)
 	}
 
 	if (!messageQueue.empty()) {
-		internalSend(messageQueue.front());
-	} else if (closed) {
+		if (socket.is_open()) {
+			// Keeps the graceful-close drain working: closeLocked(false) leaves the
+			// socket open so queued messages still flush.
+			internalSend(messageQueue.front());
+		} else {
+			// A forced close cancelled the socket while this write was pending.
+			// Nothing left can be flushed, and no write is in flight, so release the
+			// remainder and finish the teardown.
+			messageQueue.clear();
+			closeSocket();
+		}
+		return;
+	}
+
+	if (closed) {
 		closeSocket();
 	}
 }
