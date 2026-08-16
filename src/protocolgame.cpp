@@ -3489,7 +3489,8 @@ void ProtocolGame::sendSaleItemList(const std::list<ShopInfo>& shop)
 				if (itemType.isFluidContainer() || itemType.isSplash()) {
 					count = player->getItemTypeCount(shopInfo.itemId, subtype); // This shop item requires extra checks
 				} else {
-					count = subtype;
+					auto findIt = tempSaleMap.find(shopInfo.itemId);
+					count = (findIt != tempSaleMap.end()) ? findIt->second : 0;
 				}
 
 				if (count > 0) {
