@@ -40,6 +40,16 @@ local KILL_REQUIREMENTS = {
 	[DIFFICULTY_MASTER] = { min = 250, max = 500 },
 }
 
+-- Weekly difficulty must also control the strength of named targets.  Without
+-- this filter a Beginner Weekly could pick any Bestiary creature, including
+-- four- and five-star creatures.
+local WEEKLY_STAR_FILTERS = {
+	[DIFFICULTY_BEGINNER] = { min = 1, max = 1 },
+	[DIFFICULTY_ADEPT] = { min = 1, max = 3 },
+	[DIFFICULTY_EXPERT] = { min = 2, max = 5 },
+	[DIFFICULTY_MASTER] = { min = 4, max = 5 },
+}
+
 -- Task counts
 local KILL_TASKS_NORMAL = 5
 local KILL_TASKS_EXPANSION = 8
@@ -105,7 +115,7 @@ local function getRewardMultiplier(completedTasks)
 	return 1
 end
 
-local function recalculateRewards(data)
+local function getTotalWeeklyRewards(data)
 	local completedKills = data.completedKillTasks or 0
 	local completedDeliveries = data.completedDeliveryTasks or 0
 	local totalCompleted = completedKills + completedDeliveries
@@ -113,9 +123,20 @@ local function recalculateRewards(data)
 		(completedKills * (HTP_PER_KILL[data.difficulty] or HTP_PER_KILL[DIFFICULTY_BEGINNER])) +
 		(completedDeliveries * HTP_PER_DELIVERY)
 
-	data.rewardHTP = basePoints * getRewardMultiplier(totalCompleted)
-	data.rewardSoulseals = totalCompleted * SOULSEALS_PER_TASK
-	data.needsReward = totalCompleted > 0
+	return basePoints * getRewardMultiplier(totalCompleted), totalCompleted * SOULSEALS_PER_TASK
+end
+
+-- A Weekly may be claimed after any completed objective. Keep a permanent
+-- ledger for the current week so later claims pay only the new amount (plus
+-- any legitimate multiplier increase), never the same objective twice.
+local function recalculateRewards(data)
+	local totalHTP, totalSoulseals = getTotalWeeklyRewards(data)
+	local claimedHTP = math.max(0, data.claimedHuntingPoints or 0)
+	local claimedSoulseals = math.max(0, data.claimedSoulseals or 0)
+
+	data.rewardHTP = math.max(0, totalHTP - claimedHTP)
+	data.rewardSoulseals = math.max(0, totalSoulseals - claimedSoulseals)
+	data.needsReward = data.rewardHTP > 0 or data.rewardSoulseals > 0
 end
 
 local function hasWeeklyProgress(data)
@@ -126,6 +147,22 @@ local function hasWeeklyProgress(data)
 		(data.completedDeliveryTasks or 0) > 0 or
 		(data.weeklyProgressFinished or 0) > 0 or
 		data.needsReward == true
+end
+
+local function hasStartedWeeklyProgress(data)
+	if (data.anyCreatureCurrent or 0) > 0
+		or (data.completedKillTasks or 0) > 0
+		or (data.completedDeliveryTasks or 0) > 0
+		or data.needsReward == true then
+		return true
+	end
+	for _, task in ipairs(data.killTasks or {}) do
+		if (task.kills or 0) > 0 then return true end
+	end
+	for _, task in ipairs(data.deliveryTasks or {}) do
+		if task.delivered == 1 then return true end
+	end
+	return false
 end
 
 local function getCurrentWeek()
@@ -145,6 +182,37 @@ end
 -- ============================================
 
 local weeklyCache = {}
+local weeklyRewardLedgerSchemaReady = nil
+
+local function ensureWeeklyRewardLedgerSchema()
+	if weeklyRewardLedgerSchemaReady ~= nil then
+		return weeklyRewardLedgerSchemaReady
+	end
+
+	local function columnExists(columnName)
+		local resultId = db.storeQuery(
+			"SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE()" ..
+			" AND TABLE_NAME = 'player_weekly_tasks' AND COLUMN_NAME = '" .. columnName .. "' LIMIT 1"
+		)
+		if resultId == false then return false end
+		result.free(resultId)
+		return true
+	end
+
+	local function ensureColumn(columnName, definition)
+		return columnExists(columnName) or db.query(
+			"ALTER TABLE `player_weekly_tasks` ADD COLUMN `" .. columnName .. "` " .. definition
+		)
+	end
+
+	weeklyRewardLedgerSchemaReady = ensureColumn("claimed_hunting_points", "INT UNSIGNED NOT NULL DEFAULT 0 AFTER `reward_hunting_points`")
+		and ensureColumn("claimed_soulseals", "INT UNSIGNED NOT NULL DEFAULT 0 AFTER `reward_soulseals`")
+		and ensureColumn("reward_ledger_version", "TINYINT UNSIGNED NOT NULL DEFAULT 0 AFTER `claimed_soulseals`")
+	if not weeklyRewardLedgerSchemaReady then
+		print("[Weekly Tasks] Could not create the reward ledger columns. Weekly rewards are disabled to prevent duplicate payments.")
+	end
+	return weeklyRewardLedgerSchemaReady
+end
 
 local function invalidateCache(playerGuid)
 	weeklyCache[playerGuid] = nil
@@ -172,6 +240,26 @@ local function normalizeLegacyTaskExperience(data)
 	end
 end
 
+local function normalizeLegacyRewardLedger(data)
+	if (data.rewardLedgerVersion or 0) >= 1 then
+		return
+	end
+
+	local totalHTP, totalSoulseals = getTotalWeeklyRewards(data)
+	-- Existing players with no pending claim already received the old reward, so
+	-- begin their ledger at the current total. If an old pending reward exists,
+	-- preserve exactly that visible pending amount for one final claim.
+	if data.needsReward then
+		data.claimedHuntingPoints = math.max(0, totalHTP - math.max(0, data.rewardHTP or 0))
+		data.claimedSoulseals = math.max(0, totalSoulseals - math.max(0, data.rewardSoulseals or 0))
+	else
+		data.claimedHuntingPoints = totalHTP
+		data.claimedSoulseals = totalSoulseals
+	end
+	data.rewardLedgerVersion = 1
+	recalculateRewards(data)
+end
+
 local function loadWeeklyData(playerGuid)
 	local cached = weeklyCache[playerGuid]
 	if cached then return cached end
@@ -189,6 +277,9 @@ local function loadWeeklyData(playerGuid)
 		deliveryTaskRewardExp = 0,
 		rewardHTP = 0,
 		rewardSoulseals = 0,
+		claimedHuntingPoints = 0,
+		claimedSoulseals = 0,
+		rewardLedgerVersion = 1,
 		soulsealsPoints = 0,
 		lastWeek = nil,
 		needsReward = false,
@@ -196,6 +287,11 @@ local function loadWeeklyData(playerGuid)
 		lastItemNotify = 0,
 		lastWeek = nil,
 	}
+
+	if not ensureWeeklyRewardLedgerSchema() then
+		weeklyCache[playerGuid] = data
+		return data
+	end
 
 	local resultId = db.storeQuery("SELECT * FROM `player_weekly_tasks` WHERE `player_id` = " .. playerGuid)
 	if resultId ~= false then
@@ -209,6 +305,9 @@ local function loadWeeklyData(playerGuid)
 		data.deliveryTaskRewardExp = result.getDataInt(resultId, "delivery_task_reward_exp")
 		data.rewardHTP = result.getDataInt(resultId, "reward_hunting_points")
 		data.rewardSoulseals = result.getDataInt(resultId, "reward_soulseals")
+		data.claimedHuntingPoints = result.getDataInt(resultId, "claimed_hunting_points")
+		data.claimedSoulseals = result.getDataInt(resultId, "claimed_soulseals")
+		data.rewardLedgerVersion = result.getDataInt(resultId, "reward_ledger_version")
 		data.soulsealsPoints = result.getDataInt(resultId, "soulseals_points")
 		data.needsReward = result.getDataInt(resultId, "needs_reward") ~= 0
 		data.weeklyProgressFinished = result.getDataInt(resultId, "weekly_progress_finished")
@@ -231,6 +330,7 @@ local function loadWeeklyData(playerGuid)
 
 		result.free(resultId)
 		normalizeLegacyTaskExperience(data)
+		normalizeLegacyRewardLedger(data)
 	end
 
 	weeklyCache[playerGuid] = data
@@ -249,21 +349,22 @@ local function saveWeeklyData(playerGuid)
 	db.asyncQuery(
 		"INSERT INTO `player_weekly_tasks` (`player_id`, `has_expansion`, `difficulty`, " ..
 		"`any_creature_total`, `any_creature_current`, `completed_kill_tasks`, `completed_delivery_tasks`, " ..
-		"`kill_task_reward_exp`, `delivery_task_reward_exp`, `reward_hunting_points`, `reward_soulseals`, " ..
+		"`kill_task_reward_exp`, `delivery_task_reward_exp`, `reward_hunting_points`, `claimed_hunting_points`, `reward_soulseals`, `claimed_soulseals`, `reward_ledger_version`, " ..
 		"`soulseals_points`, `needs_reward`, `weekly_progress_finished`, " ..
 		"`kill_tasks`, `delivery_tasks`, `last_week`, `last_item_notify`) " ..
 		"VALUES (" .. playerGuid .. ", " .. (data.hasExpansion and 1 or 0) .. ", " .. data.difficulty .. ", " ..
 		data.anyCreatureTotal .. ", " .. data.anyCreatureCurrent .. ", " ..
 		data.completedKillTasks .. ", " .. data.completedDeliveryTasks .. ", " ..
 		data.killTaskRewardExp .. ", " .. data.deliveryTaskRewardExp .. ", " ..
-		data.rewardHTP .. ", " .. data.rewardSoulseals .. ", " ..
+		data.rewardHTP .. ", " .. data.claimedHuntingPoints .. ", " .. data.rewardSoulseals .. ", " .. data.claimedSoulseals .. ", " .. data.rewardLedgerVersion .. ", " ..
 		data.soulsealsPoints .. ", " .. (data.needsReward and 1 or 0) .. ", " .. data.weeklyProgressFinished .. ", " ..
 		db.escapeString(ktJson) .. ", " .. db.escapeString(dtJson) .. ", " .. db.escapeString(data.lastWeek or "") .. ", " .. data.lastItemNotify .. ") " ..
 		"ON DUPLICATE KEY UPDATE `has_expansion` = VALUES(`has_expansion`), `difficulty` = VALUES(`difficulty`), " ..
 		"`any_creature_total` = VALUES(`any_creature_total`), `any_creature_current` = VALUES(`any_creature_current`), " ..
 		"`completed_kill_tasks` = VALUES(`completed_kill_tasks`), `completed_delivery_tasks` = VALUES(`completed_delivery_tasks`), " ..
 		"`kill_task_reward_exp` = VALUES(`kill_task_reward_exp`), `delivery_task_reward_exp` = VALUES(`delivery_task_reward_exp`), " ..
-		"`reward_hunting_points` = VALUES(`reward_hunting_points`), `reward_soulseals` = VALUES(`reward_soulseals`), " ..
+		"`reward_hunting_points` = VALUES(`reward_hunting_points`), `claimed_hunting_points` = VALUES(`claimed_hunting_points`), " ..
+		"`reward_soulseals` = VALUES(`reward_soulseals`), `claimed_soulseals` = VALUES(`claimed_soulseals`), `reward_ledger_version` = VALUES(`reward_ledger_version`), " ..
 		"`soulseals_points` = VALUES(`soulseals_points`), `needs_reward` = VALUES(`needs_reward`), " ..
 		"`weekly_progress_finished` = VALUES(`weekly_progress_finished`), " ..
 		"`kill_tasks` = VALUES(`kill_tasks`), `delivery_tasks` = VALUES(`delivery_tasks`), `last_week` = VALUES(`last_week`), " ..
@@ -309,6 +410,9 @@ function WeeklyTasks.performWeeklyReset(player)
 	data.deliveryTaskRewardExp = 0
 	data.rewardHTP = 0
 	data.rewardSoulseals = 0
+	data.claimedHuntingPoints = 0
+	data.claimedSoulseals = 0
+	data.rewardLedgerVersion = 1
 	data.needsReward = false
 	data.weeklyProgressFinished = 0
 	data.lastWeek = getCurrentWeek()
@@ -331,19 +435,24 @@ function WeeklyTasks.distributeRewards(player)
 	end
 
 	-- Give hunting task points
-	if data.rewardHTP > 0 then
-		player:addTaskHuntingPoints(data.rewardHTP)
+	local pendingHTP = data.rewardHTP
+	local pendingSoulseals = data.rewardSoulseals
+
+	if pendingHTP > 0 then
+		player:addTaskHuntingPoints(pendingHTP)
 		protocol.sendResourceBalance(player, protocol.RESOURCE_TASK_HUNTING, player:getTaskHuntingPoints())
 	end
 
 	-- Give soulseals
-	if data.rewardSoulseals > 0 then
-		player:addSoulsealsPoints(data.rewardSoulseals)
+	if pendingSoulseals > 0 then
+		player:addSoulsealsPoints(pendingSoulseals)
 		data.soulsealsPoints = player:getSoulsealsPoints()
 		protocol.sendResourceBalance(player, protocol.RESOURCE_SOULSEALS_POINTS, data.soulsealsPoints)
 	end
 
-	data.needsReward = false
+	data.claimedHuntingPoints = (data.claimedHuntingPoints or 0) + pendingHTP
+	data.claimedSoulseals = (data.claimedSoulseals or 0) + pendingSoulseals
+	recalculateRewards(data)
 	saveWeeklyData(playerGuid)
 	return true
 end
@@ -359,8 +468,9 @@ function WeeklyTasks.selectDifficulty(player, difficulty)
 	local data = loadWeeklyData(playerGuid)
 	data.hasExpansion = player:hasWeeklyExpansion()
 
-	-- Can only set once per week; block if progress is already finished
-	if data.weeklyProgressFinished == 1 then
+	-- The player may freely replace an untouched list, but never replace a
+	-- Weekly after any kill, delivery or reward progress has started.
+	if hasStartedWeeklyProgress(data) then
 		return false
 	end
 
@@ -387,9 +497,13 @@ local function appendKillTasks(data, targetCount)
 	end
 
 	local eligible = {}
+	local starFilter = WEEKLY_STAR_FILTERS[data.difficulty] or WEEKLY_STAR_FILTERS[DIFFICULTY_BEGINNER]
 	for raceId, entry in pairs(CustomBestiary.monstersByRaceId) do
 		local numericRaceId = tonumber(raceId)
-		if numericRaceId and numericRaceId > 0 and not usedRaceIds[numericRaceId] and (tonumber(entry.experience) or 0) > 0 then
+		local stars = tonumber(entry.stars) or 0
+		if numericRaceId and numericRaceId > 0 and not usedRaceIds[numericRaceId]
+			and (tonumber(entry.experience) or 0) > 0
+			and stars >= starFilter.min and stars <= starFilter.max then
 			eligible[#eligible + 1] = numericRaceId
 		end
 	end
@@ -468,6 +582,15 @@ function WeeklyTasks.generateTasks(player)
 	local playerGuid = getPlayerGuid(player)
 	local data = loadWeeklyData(playerGuid)
 	data.hasExpansion = player:hasWeeklyExpansion()
+	data.completedKillTasks = 0
+	data.completedDeliveryTasks = 0
+	data.rewardHTP = 0
+	data.rewardSoulseals = 0
+	data.claimedHuntingPoints = 0
+	data.claimedSoulseals = 0
+	data.rewardLedgerVersion = 1
+	data.needsReward = false
+	data.weeklyProgressFinished = 0
 
 	local difficulty = data.difficulty or DIFFICULTY_BEGINNER
 	local hasExpansion = data.hasExpansion
