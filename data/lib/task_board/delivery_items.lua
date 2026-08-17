@@ -3,16 +3,18 @@
 
 return {
 	[0] = {
-		{ itemId = 811, amount = 20 },  -- Terra Mantle
-		{ itemId = 813, amount = 20 },  -- Terra Boots
-		{ itemId = 818, amount = 20 },  -- Magma Boots
-		{ itemId = 819, amount = 20 },  -- Glacier Shoes
-		{ itemId = 820, amount = 20 },  -- Lightning Boots
-		{ itemId = 821, amount = 20 },  -- Magma Legs
-		{ itemId = 824, amount = 20 },  -- Glacier Robe
-		{ itemId = 825, amount = 20 },  -- Lightning Robe
-		{ itemId = 826, amount = 20 },  -- Magma Coat
-		{ itemId = 827, amount = 20 },  -- Magma Monocle
+		-- Beginner deliveries use common food, so a new player never needs to
+		-- sacrifice rare equipment merely to complete their first Weekly.
+		{ itemId = 3577, amount = 25 }, -- Meat
+		{ itemId = 3578, amount = 25 }, -- Fish
+		{ itemId = 3582, amount = 20 }, -- Ham
+		{ itemId = 3585, amount = 30 }, -- Red Apple
+		{ itemId = 3587, amount = 30 }, -- Banana
+		{ itemId = 3595, amount = 30 }, -- Carrot
+		{ itemId = 3596, amount = 30 }, -- Tomato
+		{ itemId = 3598, amount = 30 }, -- Cookie
+		{ itemId = 3600, amount = 25 }, -- Bread
+		{ itemId = 3607, amount = 20 }, -- Cheese
 	},
 
 	[1] = {
