@@ -21,6 +21,7 @@ if _TASK_HUNTING_MODULE then
 end
 
 local TaskHunting = {}
+local MapSpawnPool = dofile("data/lib/task_board/map_spawn_pool.lua")
 
 TaskHunting.DEBUG = false
 
@@ -344,7 +345,7 @@ local function generateRaceList(player, data, slot)
 	local excluded = collectExcludedRaceIds(data, slot)
 	local buckets = { {}, {}, {}, {} }
 	for raceId, entry in pairs(CustomBestiary.monstersByRaceId) do
-		if not excluded[raceId] and (entry.experience or 0) > 0 then
+		if not excluded[raceId] and MapSpawnPool.isHuntingTarget(entry, player:getLevel()) then
 			local stars = clamp(entry.stars, 1, 5)
 			local bucket = stars <= 1 and 1 or (stars == 2 and 2 or (stars == 3 and 3 or 4))
 			buckets[bucket][#buckets[bucket] + 1] = raceId
@@ -398,7 +399,7 @@ local function generateRaceList(player, data, slot)
 	return selected
 end
 
-local function generateWildcardRaceList(data, slot)
+local function generateWildcardRaceList(player, data, slot)
 	if not CustomBestiary or not CustomBestiary.monstersByRaceId then
 		return {}
 	end
@@ -406,12 +407,22 @@ local function generateWildcardRaceList(data, slot)
 	local excluded = collectExcludedRaceIds(data, slot)
 	local raceList = {}
 	for candidateRaceId, entry in pairs(CustomBestiary.monstersByRaceId) do
-		if not excluded[candidateRaceId] and (entry.experience or 0) > 0 then
+		if not excluded[candidateRaceId] and MapSpawnPool.isHuntingTarget(entry, player:getLevel()) then
 			raceList[#raceList + 1] = candidateRaceId
 		end
 	end
 	table.sort(raceList)
 	return raceList
+end
+
+local function hasUnavailableRaceId(player, raceList)
+	for _, raceId in ipairs(raceList or {}) do
+		local entry = CustomBestiary and CustomBestiary.getMonster(raceId)
+		if not entry or not MapSpawnPool.isHuntingTarget(entry, player:getLevel()) then
+			return true
+		end
+	end
+	return false
 end
 
 local function ensureSlotReady(player, data, slot)
@@ -435,7 +446,7 @@ local function ensureSlotReady(player, data, slot)
 		slotData.raceList = {}
 	end
 
-	if slotData.state == STATE_SELECT and #slotData.raceList == 0 then
+	if slotData.state == STATE_SELECT and (#slotData.raceList == 0 or hasUnavailableRaceId(player, slotData.raceList)) then
 		slotData.wildcard = false
 		slotData.raceList = generateRaceList(player, data, slot)
 	end
@@ -582,7 +593,7 @@ function TaskHunting.sendSlotData(player, slot)
 	if state == STATE_LOCKED then
 		out:addByte(lockType)
 	elseif state == STATE_SELECT or state == STATE_WILDCARD then
-		local raceList = state == STATE_WILDCARD and generateWildcardRaceList(data, slot) or slotData.raceList
+		local raceList = state == STATE_WILDCARD and generateWildcardRaceList(player, data, slot) or slotData.raceList
 		writeRaceList(out, raceList, getBestiaryKills(player))
 	elseif state == STATE_ACTIVE or state == STATE_REDEEM then
 		local entry = CustomBestiary and CustomBestiary.getMonster(slotData.selectedRaceId)
@@ -726,7 +737,7 @@ local function handleAction(player, slot, action, wantsUpgrade, raceId)
 		if slotData.state ~= STATE_SELECT then
 			return sendFailure(player, "This slot cannot select a wildcard creature now.")
 		end
-		local wildcardRaceList = generateWildcardRaceList(data, slot)
+		local wildcardRaceList = generateWildcardRaceList(player, data, slot)
 		if #wildcardRaceList == 0 then
 			return sendFailure(player, "There are no valid wildcard creatures for this slot.")
 		end
@@ -741,7 +752,7 @@ local function handleAction(player, slot, action, wantsUpgrade, raceId)
 		if slotData.state ~= STATE_SELECT and slotData.state ~= STATE_WILDCARD then
 			return sendFailure(player, "This slot is not waiting for a creature selection.")
 		end
-		local availableRaceList = slotData.state == STATE_WILDCARD and generateWildcardRaceList(data, slot) or slotData.raceList
+		local availableRaceList = slotData.state == STATE_WILDCARD and generateWildcardRaceList(player, data, slot) or slotData.raceList
 		if not containsRace(availableRaceList, raceId) then
 			return sendFailure(player, "That creature is not available for this slot.")
 		end
