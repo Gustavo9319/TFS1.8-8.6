@@ -2,6 +2,7 @@
 -- Uses KV store for simple values, DB table for complex data.
 
 local WeeklyTasks = {}
+local MapSpawnPool = dofile("data/lib/task_board/map_spawn_pool.lua")
 
 local protocol -- set by init.lua
 
@@ -38,16 +39,6 @@ local KILL_REQUIREMENTS = {
 	[DIFFICULTY_ADEPT] = { min = 100, max = 250 },
 	[DIFFICULTY_EXPERT] = { min = 200, max = 350 },
 	[DIFFICULTY_MASTER] = { min = 250, max = 500 },
-}
-
--- Weekly difficulty must also control the strength of named targets.  Without
--- this filter a Beginner Weekly could pick any Bestiary creature, including
--- four- and five-star creatures.
-local WEEKLY_STAR_FILTERS = {
-	[DIFFICULTY_BEGINNER] = { min = 1, max = 1 },
-	[DIFFICULTY_ADEPT] = { min = 1, max = 3 },
-	[DIFFICULTY_EXPERT] = { min = 2, max = 5 },
-	[DIFFICULTY_MASTER] = { min = 4, max = 5 },
 }
 
 -- Task counts
@@ -468,9 +459,9 @@ function WeeklyTasks.selectDifficulty(player, difficulty)
 	local data = loadWeeklyData(playerGuid)
 	data.hasExpansion = player:hasWeeklyExpansion()
 
-	-- The player may freely replace an untouched list, but never replace a
-	-- Weekly after any kill, delivery or reward progress has started.
-	if hasStartedWeeklyProgress(data) then
+	-- The difficulty is chosen once per Weekly.  Regenerating an untouched list
+	-- allowed players to reroll indefinitely until they received ideal targets.
+	if hasWeeklyProgress(data) then
 		return false
 	end
 
@@ -497,13 +488,10 @@ local function appendKillTasks(data, targetCount)
 	end
 
 	local eligible = {}
-	local starFilter = WEEKLY_STAR_FILTERS[data.difficulty] or WEEKLY_STAR_FILTERS[DIFFICULTY_BEGINNER]
 	for raceId, entry in pairs(CustomBestiary.monstersByRaceId) do
 		local numericRaceId = tonumber(raceId)
-		local stars = tonumber(entry.stars) or 0
 		if numericRaceId and numericRaceId > 0 and not usedRaceIds[numericRaceId]
-			and (tonumber(entry.experience) or 0) > 0
-			and stars >= starFilter.min and stars <= starFilter.max then
+			and MapSpawnPool.isDifficultyTarget(entry, data.difficulty) then
 			eligible[#eligible + 1] = numericRaceId
 		end
 	end
