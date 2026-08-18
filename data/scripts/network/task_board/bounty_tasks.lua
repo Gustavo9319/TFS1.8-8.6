@@ -2,6 +2,7 @@
 -- Uses TaskBoardProtocol for byte serialization and KV store for persistence.
 
 local BountyTasks = {}
+local MapSpawnPool = dofile("data/lib/task_board/map_spawn_pool.lua")
 
 local protocol -- set by init.lua after loading
 
@@ -56,14 +57,6 @@ local KILL_RANGES = {
 	[DIFFICULTY_ADEPT] = { min = 100, max = 200 },
 	[DIFFICULTY_EXPERT] = { min = 200, max = 300 },
 	[DIFFICULTY_MASTER] = { min = 300, max = 600 },
-}
-
--- Bestiary star filters by difficulty
-local STAR_FILTERS = {
-	[DIFFICULTY_BEGINNER] = { min = 0, max = 1 },
-	[DIFFICULTY_ADEPT] = { min = 0, max = 3 },
-	[DIFFICULTY_EXPERT] = { min = 2, max = 5 },
-	[DIFFICULTY_MASTER] = { min = 4, max = 6 },
 }
 
 local TALISMAN_STANDARD_MAX_LEVEL = 166
@@ -326,20 +319,26 @@ local function getEligibleRaceIds(difficulty)
 		return {}
 	end
 
-	local starFilter = STAR_FILTERS[difficulty]
 	local eligible = {}
 
 	for raceId, entry in pairs(CustomBestiary.monstersByRaceId) do
-		local stars = entry.stars or 0
-		if stars >= starFilter.min and stars <= starFilter.max then
-			-- Match Crystal: task creatures must grant experience.
-			if entry.name and entry.name ~= "" and (tonumber(entry.experience) or 0) > 0 then
-				eligible[#eligible + 1] = raceId
-			end
+		if MapSpawnPool.isDifficultyTarget(entry, difficulty) then
+			eligible[#eligible + 1] = raceId
 		end
 	end
 
 	return eligible
+end
+
+local function hasUnavailableBountyOffer(creatures, difficulty)
+	for _, creature in ipairs(creatures or {}) do
+		local raceId = tonumber(creature.raceId) or 0
+		local entry = raceId > 0 and CustomBestiary and CustomBestiary.getMonster(raceId) or nil
+		if raceId > 0 and not MapSpawnPool.isDifficultyTarget(entry, difficulty) then
+			return true
+		end
+	end
+	return false
 end
 
 local function getPreferredCreatureRaceIds()
@@ -351,7 +350,8 @@ local function getPreferredCreatureRaceIds()
 	for raceId, entry in pairs(CustomBestiary.monstersByRaceId) do
 		local numericRaceId = tonumber(raceId)
 		if numericRaceId and numericRaceId > 0 and numericRaceId <= 0xFFFF and
-			entry.name and entry.name ~= "" and (tonumber(entry.experience) or 0) > 0 then
+			entry.name and entry.name ~= "" and (tonumber(entry.experience) or 0) > 0
+			and MapSpawnPool.hasMonster(entry.name) then
 			raceIds[#raceIds + 1] = numericRaceId
 		end
 	end
@@ -497,8 +497,16 @@ function BountyTasks.openBounty(player)
 	local playerGuid = getPlayerGuid(player)
 	local data = loadBountyData(playerGuid)
 
-	-- Preserve active/completed states — only generate new list when idle or finished claiming
-	if data.state == STATE_SELECTION or data.state == STATE_ACTIVE or data.state == STATE_COMPLETED then
+	-- Preserve active/completed states. A saved selection made before the
+	-- normal-map filter is refreshed once, without consuming a reroll token.
+	if data.state == STATE_SELECTION then
+		if hasUnavailableBountyOffer(data.creaturesList, data.difficulty) then
+			data.creaturesList = generateCreatureList(data)
+			saveBountyData(playerGuid)
+		end
+		return BountyTasks.sendBountyData(player)
+	end
+	if data.state == STATE_ACTIVE or data.state == STATE_COMPLETED then
 		return BountyTasks.sendBountyData(player)
 	end
 
@@ -827,8 +835,9 @@ function BountyTasks.assignPreferred(player, slot, raceId)
 		return false
 	end
 
-	-- Validate raceId exists
-	if CustomBestiary and not CustomBestiary.getMonster(raceId) then
+	-- Preferences must point to a creature that can actually be hunted on the map.
+	local entry = CustomBestiary and CustomBestiary.getMonster(raceId)
+	if not entry or not MapSpawnPool.hasMonster(entry.name) then
 		return false
 	end
 
@@ -849,8 +858,9 @@ function BountyTasks.assignUnwanted(player, slot, raceId)
 		return false
 	end
 
-	-- Validate raceId exists
-	if CustomBestiary and not CustomBestiary.getMonster(raceId) then
+	-- Preferences must point to a creature that can actually be hunted on the map.
+	local entry = CustomBestiary and CustomBestiary.getMonster(raceId)
+	if not entry or not MapSpawnPool.hasMonster(entry.name) then
 		return false
 	end
 
