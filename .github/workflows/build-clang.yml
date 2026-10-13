@@ -60,13 +60,13 @@ jobs:
       - name: Cache Lua 5.5 source
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
-          path: ${{ github.workspace }}/.cache/lua/lua-5.5.0.tar.gz
+          path: ${{ runner.temp }}/lua-source/lua-5.5.0.tar.gz
           key: lua-source-5.5.0-57ccc32bbbd005cab75bcc52444052535
 
       - name: Build patched Lua 5.5 from source
         run: |
           set -euo pipefail
-          cache_tar="$GITHUB_WORKSPACE/.cache/lua/lua-5.5.0.tar.gz"
+          cache_tar="$RUNNER_TEMP/lua-source/lua-5.5.0.tar.gz"
           expected_sha="57ccc32bbbd005cab75bcc52444052535af691789dba2b9016d5c50640d68b3d"
           mkdir -p "$(dirname "$cache_tar")"
 
@@ -121,6 +121,7 @@ jobs:
           -DENABLE_SLOW_TASK_DETECTION=OFF
           -DUSE_MIMALLOC=OFF
           -DBUILD_TESTING=ON
+          -DENABLE_TEST_LTO=OFF
           -DSKIP_GIT=OFF
           -DLUA_INCLUDE_DIR=/usr/local/include
           -DLUA_LIBRARY=/usr/local/lib/liblua.a
@@ -131,4 +132,4 @@ jobs:
         run: cmake --build build --parallel $(nproc)
 
       - name: Run tests
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --no-tests=error
