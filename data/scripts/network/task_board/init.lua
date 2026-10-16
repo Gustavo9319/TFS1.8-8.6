@@ -24,12 +24,12 @@ local soulsealsEnabled = configManager.getBoolean(configKeys.SOULSEALS_SYSTEM_EN
 -- ============================================
 
 -- Protocol (always needed for resource balance at minimum)
-local protocol = dofile("data/scripts/network/task_board/protocol.lua")
+local protocol = _TASK_BOARD_PROTOCOL_MODULE or dofile("data/scripts/network/task_board/protocol.lua")
 
 -- Bounty tasks
 local bounty = nil
 if bountyEnabled then
-	bounty = dofile("data/scripts/network/task_board/bounty_tasks.lua")
+	bounty = _TASK_BOARD_BOUNTY_MODULE or dofile("data/scripts/network/task_board/bounty_tasks.lua")
 	if bounty and bounty.setProtocol then
 		bounty.setProtocol(protocol)
 	end
@@ -38,21 +38,21 @@ end
 -- Weekly tasks
 local weekly = nil
 if weeklyEnabled then
-	weekly = dofile("data/scripts/network/task_board/weekly_tasks.lua")
+	weekly = _TASK_BOARD_WEEKLY_MODULE or dofile("data/scripts/network/task_board/weekly_tasks.lua")
 	if weekly and weekly.setProtocol then
 		weekly.setProtocol(protocol)
 	end
 end
 
 -- Hunting shop
-local shop = dofile("data/scripts/network/task_board/hunting_shop.lua")
+local shop = _TASK_BOARD_SHOP_MODULE or dofile("data/scripts/network/task_board/hunting_shop.lua")
 if shop and shop.setProtocol then
 	shop.setProtocol(protocol)
 end
 
 local soulseal = nil
 if soulsealsEnabled then
-	soulseal = dofile("data/scripts/network/task_board/soulseal_handler.lua")
+	soulseal = _TASK_BOARD_SOULSEAL_MODULE or dofile("data/scripts/network/task_board/soulseal_handler.lua")
 	if soulseal and soulseal.setProtocol then
 		soulseal.setProtocol(protocol)
 	end
@@ -112,7 +112,10 @@ end
 local taskBoardActionHandler = PacketHandler(OPCODE_TASK_BOARD_ACTION)
 
 function taskBoardActionHandler.onReceive(player, msg)
-	if not player or not player.isUsingAstraClient or not player:isUsingAstraClient() then return end
+	if not player then return end
+	local customClient = (player.isUsingAstraClient and player:isUsingAstraClient())
+		or (player.isUsingFonticakClient and player:isUsingFonticakClient())
+	if not customClient then return end
 
 	local payload = protocol.parseTaskBoardAction(msg)
 	if not payload then
@@ -139,7 +142,9 @@ function taskBoardActionHandler.onReceive(player, msg)
 
     elseif option == 1 then -- Open Weekly
         if not weeklyEnabled then return end
-        if weekly then weekly.sendWeeklyData(player) end
+        if weekly and weekly.openWeekly then
+            weekly.openWeekly(player)
+        end
 	elseif option == 2 then -- Change Difficulty
 		if not bountyEnabled then return end
 		if bounty then bounty.changeDifficulty(player, payload.difficulty) end

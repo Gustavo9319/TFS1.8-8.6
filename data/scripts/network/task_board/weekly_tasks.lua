@@ -1,9 +1,26 @@
 -- Weekly Tasks logic: kill/delivery task generation, tracking, weekly reset, soulseal rewards.
 -- Uses KV store for simple values, DB table for complex data.
 
+-- The revscript loader also executes this file after task_board/init.lua dofile's it.
+-- Without a singleton, a second copy registers onItemMoved with protocol still nil.
+if _TASK_BOARD_WEEKLY_MODULE then
+	return _TASK_BOARD_WEEKLY_MODULE
+end
+
 local WeeklyTasks = {}
 
-local protocol -- set by init.lua
+local protocol -- set by init.lua (or TaskBoardProtocol once init finishes)
+
+local function getProtocol()
+	if protocol then
+		return protocol
+	end
+	if TaskBoardProtocol then
+		protocol = TaskBoardProtocol
+		return protocol
+	end
+	return nil
+end
 
 -- Difficulty constants
 local DIFFICULTY_BEGINNER = 0
@@ -330,17 +347,23 @@ function WeeklyTasks.distributeRewards(player)
 		return false
 	end
 
+	local proto = getProtocol()
+
 	-- Give hunting task points
 	if data.rewardHTP > 0 then
 		player:addTaskHuntingPoints(data.rewardHTP)
-		protocol.sendResourceBalance(player, protocol.RESOURCE_TASK_HUNTING, player:getTaskHuntingPoints())
+		if proto then
+			proto.sendResourceBalance(player, proto.RESOURCE_TASK_HUNTING, player:getTaskHuntingPoints())
+		end
 	end
 
 	-- Give soulseals
 	if data.rewardSoulseals > 0 then
 		player:addSoulsealsPoints(data.rewardSoulseals)
 		data.soulsealsPoints = player:getSoulsealsPoints()
-		protocol.sendResourceBalance(player, protocol.RESOURCE_SOULSEALS_POINTS, data.soulsealsPoints)
+		if proto then
+			proto.sendResourceBalance(player, proto.RESOURCE_SOULSEALS_POINTS, data.soulsealsPoints)
+		end
 	end
 
 	data.needsReward = false
@@ -579,13 +602,15 @@ function WeeklyTasks.onKill(player, raceId)
 		if shouldSave or shouldFullSync then
 			saveWeeklyData(playerGuid)
 		end
-		if protocol and protocol.sendWeeklyKillUpdate then
-			for _, update in ipairs(killUpdates) do
-				protocol.sendWeeklyKillUpdate(player, update.raceId, update.current, update.total, update.completed)
-			end
-		end
 		if shouldFullSync then
 			WeeklyTasks.sendWeeklyData(player)
+		else
+			local proto = getProtocol()
+			if proto and proto.sendWeeklyKillUpdate then
+				for _, update in ipairs(killUpdates) do
+					proto.sendWeeklyKillUpdate(player, update.raceId, update.current, update.total, update.completed)
+				end
+			end
 		end
 	end
 
@@ -604,11 +629,14 @@ function WeeklyTasks.deliverTask(player, taskIndex)
 
 	local dt = data.deliveryTasks[taskIndex + 1]
 	if not dt then return false end
-	if dt.delivered == 1 then return false end
+	if tonumber(dt.delivered) == 1 then return false end
 
 	-- Count items in player inventory
 	local itemId = dt.itemId
-	local required = dt.required
+	local required = tonumber(dt.required) or tonumber(dt.amount) or 0
+	if required <= 0 or not itemId then
+		return false
+	end
 
 	local countResult = player:getItemCount(itemId, -1, true) or 0
 	if countResult >= required then
@@ -699,6 +727,15 @@ end
 -- SEND TO CLIENT
 -- ============================================
 
+function WeeklyTasks.openWeekly(player)
+	local playerGuid = getPlayerGuid(player)
+	local data = loadWeeklyData(playerGuid)
+	if data.weeklyProgressFinished ~= 1 and #data.killTasks == 0 and #data.deliveryTasks == 0 then
+		WeeklyTasks.generateTasks(player)
+	end
+	return WeeklyTasks.sendWeeklyData(player)
+end
+
 function WeeklyTasks.sendWeeklyData(player)
 	local playerGuid = getPlayerGuid(player)
 	local data = loadWeeklyData(playerGuid)
@@ -761,14 +798,27 @@ function WeeklyTasks.sendWeeklyData(player)
 		hasExpansion = data.hasExpansion or false,
 	}
 
-	return protocol.sendWeeklyTaskData(player, protocolData)
+	local proto = getProtocol()
+	if not proto or not proto.sendWeeklyTaskData then
+		return false
+	end
+	return proto.sendWeeklyTaskData(player, protocolData)
 end
 
 function WeeklyTasks.setProtocol(protoModule)
 	protocol = protoModule
 end
 
+local ITEM_NOTIFY_INTERVAL = 200
+local weeklyDeliveryNotifyEvents = {}
+
 function WeeklyTasks.saveOnLogout(player)
+	local playerId = player:getId()
+	if weeklyDeliveryNotifyEvents[playerId] then
+		stopEvent(weeklyDeliveryNotifyEvents[playerId])
+		weeklyDeliveryNotifyEvents[playerId] = nil
+	end
+
 	local playerGuid = getPlayerGuid(player)
 	local data = loadWeeklyData(playerGuid)
 	data.hasExpansion = player:hasWeeklyExpansion()
@@ -816,19 +866,40 @@ local function notifyDeliveryItemChange(player, item)
 		return
 	end
 
-	local now = os.mtime and os.mtime() or (os.time() * 1000)
-	if now - (data.lastItemNotify or 0) < ITEM_NOTIFY_INTERVAL then
+	local playerId = player:getId()
+	if weeklyDeliveryNotifyEvents[playerId] then
 		return
 	end
 
-	data.lastItemNotify = now
-	WeeklyTasks.sendWeeklyData(player)
+	local now = os.mtime and os.mtime() or (os.time() * 1000)
+	local elapsed = now - (data.lastItemNotify or 0)
+	local delay = ITEM_NOTIFY_INTERVAL
+	if elapsed < ITEM_NOTIFY_INTERVAL then
+		delay = ITEM_NOTIFY_INTERVAL - elapsed
+	end
+
+	weeklyDeliveryNotifyEvents[playerId] = addEvent(function()
+		weeklyDeliveryNotifyEvents[playerId] = nil
+		local onlinePlayer = Player(playerId)
+		if not onlinePlayer then
+			return
+		end
+		local freshData = loadWeeklyData(getPlayerGuid(onlinePlayer))
+		freshData.lastItemNotify = os.mtime and os.mtime() or (os.time() * 1000)
+		WeeklyTasks.sendWeeklyData(onlinePlayer)
+	end, delay)
 end
 
-local weeklyDeliveryItemMoved = Event()
-weeklyDeliveryItemMoved.onItemMoved = function(player, item)
-	notifyDeliveryItemChange(player, item)
+if not _WEEKLY_DELIVERY_ITEM_MOVED_EVENT_REGISTERED then
+	_WEEKLY_DELIVERY_ITEM_MOVED_EVENT_REGISTERED = true
+
+	local weeklyDeliveryItemMoved = Event()
+	weeklyDeliveryItemMoved.onItemMoved = function(player, item)
+		notifyDeliveryItemChange(player, item)
+	end
+	weeklyDeliveryItemMoved:register()
 end
-weeklyDeliveryItemMoved:register()
+
+_TASK_BOARD_WEEKLY_MODULE = WeeklyTasks
 
 return WeeklyTasks

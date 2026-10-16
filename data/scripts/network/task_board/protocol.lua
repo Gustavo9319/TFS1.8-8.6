@@ -3,7 +3,12 @@
 --           0xEE (resource balance). Task Hunting owns 0xBA/0xBB.
 -- All send functions use NetworkMessage. All receive handlers use PacketHandler + NetworkGuard.
 
+if _TASK_BOARD_PROTOCOL_MODULE then
+	return _TASK_BOARD_PROTOCOL_MODULE
+end
+
 local TaskBoardProtocol = {}
+_TASK_BOARD_PROTOCOL_MODULE = TaskBoardProtocol
 
 -- Resource type constants matching Crystal ServerDefinitions.hpp
 local RESOURCE_TASK_HUNTING = TaskBoard.Resources.TASK_HUNTING
@@ -105,7 +110,13 @@ local OPCODE_RESOURCE_BALANCE = 0xEE
 local BOUNTY_EXTENSION_MARKER = 0x5441534B424F4152
 
 local function supportsCustomNetwork(player)
-	return player and player.isUsingAstraClient and player:isUsingAstraClient()
+	if not player then
+		return false
+	end
+	if player.isUsingAstraClient and player:isUsingAstraClient() then
+		return true
+	end
+	return player.isUsingFonticakClient and player:isUsingFonticakClient()
 end
 
 local function clamp(value, minValue, maxValue)
@@ -272,6 +283,10 @@ function TaskBoardProtocol.sendBountyTaskData(player, data)
 		end
 	end
 
+	if TaskBoard and TaskBoard.getTimedBoostRemaining and TaskBoard.Storage then
+		out:addU32(clamp(TaskBoard.getTimedBoostRemaining(player, TaskBoard.Storage.BOUNTY_KILL_BOOST_UNTIL), 0, 0xFFFFFFFF))
+	end
+
 	return out:sendToPlayer(player)
 end
 
@@ -328,6 +343,11 @@ function TaskBoardProtocol.sendWeeklyTaskData(player, data)
 	out:addU32(clamp(data.soulsealsBalance or 0, 0, 0xFFFFFFFF))
 	out:addByte(data.needsReward and 1 or 0)
 	out:addByte(data.hasExpansion and 1 or 0)
+
+	if TaskBoard and TaskBoard.getTimedBoostRemaining and TaskBoard.Storage then
+		out:addU32(clamp(TaskBoard.getTimedBoostRemaining(player, TaskBoard.Storage.WEEKLY_KILL_BOOST_UNTIL), 0, 0xFFFFFFFF))
+		out:addU32(clamp(TaskBoard.getTimedBoostRemaining(player, TaskBoard.Storage.WEEKLY_REDUCED_ITEMS_UNTIL), 0, 0xFFFFFFFF))
+	end
 
 	return out:sendToPlayer(player)
 end

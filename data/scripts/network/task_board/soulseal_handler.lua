@@ -13,8 +13,13 @@ if not SoulPit then
 	dofile("data/lib/others/soulpit.lua")
 end
 
+if _TASK_BOARD_SOULSEAL_MODULE then
+	return _TASK_BOARD_SOULSEAL_MODULE
+end
+
 local protocol
 local SoulSealHandler = {}
+_TASK_BOARD_SOULSEAL_MODULE = SoulSealHandler
 
 local function isNearSoulpitObelisk(player)
 	local playerPosition = player and player:getPosition()
@@ -28,7 +33,13 @@ local function isNearSoulpitObelisk(player)
 end
 
 local function isAstraPlayer(player)
-	return player and player.isUsingAstraClient and player:isUsingAstraClient()
+	if not player then
+		return false
+	end
+	if player.isUsingAstraClient and player:isUsingAstraClient() then
+		return true
+	end
+	return player.isUsingFonticakClient and player:isUsingFonticakClient()
 end
 
 function SoulSealHandler.sendSoulSealsData(player)
