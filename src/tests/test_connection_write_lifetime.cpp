@@ -16,7 +16,6 @@
 #include "../connection.h"
 #include "../outputmessage.h"
 #include "../protocol.h"
-
 #include "test_support.h"
 
 // Grants the tests access to Connection internals. Declared as a friend in
@@ -147,7 +146,9 @@ struct ConnectedPair
 
 	~ConnectedPair()
 	{
-		connection->close(Connection::FORCE_CLOSE);
+		// Assertions can throw before a case reaches resetConnectionManager().
+		// Release the manager's ownership before destroying this io_context.
+		if (connection) connection->close(Connection::FORCE_CLOSE);
 		asio::error_code ignored;
 		peer.close(ignored);
 		acceptor.close(ignored);

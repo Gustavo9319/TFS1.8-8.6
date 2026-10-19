@@ -4,6 +4,7 @@
 #include "otpch.h"
 
 #include "reactor.h"
+#include "reactor_heap.h"
 
 #include "configmanager.h"
 #include "logger.h"
@@ -15,17 +16,13 @@
 TaskReactor g_reactor;
 thread_local const TaskReactor* TaskReactor::currentReactor = nullptr;
 
-TaskReactor::TaskReactor() :
-	maxTasksPerCycle(0),
-	timeBudget(0),
-	maxInboxSize(REACTOR_MAX_INBOX_SIZE)
-{}
+TaskReactor::TaskReactor() : maxTasksPerCycle(0), timeBudget(0), maxInboxSize(REACTOR_MAX_INBOX_SIZE)
+{
+	readyTasksBuffer.reserve(1024);
+}
 
 namespace {
-auto distantFuture() noexcept
-{
-	return std::chrono::steady_clock::time_point::max();
-}
+auto distantFuture() noexcept { return std::chrono::steady_clock::time_point::max(); }
 
 std::string taskLabel(const std::string& description, const std::string& origin)
 {
@@ -44,10 +41,7 @@ bool TaskReactor::Task::hasExpired(std::chrono::steady_clock::time_point now) co
 	return deadline != distantFuture() && deadline <= now;
 }
 
-void TaskReactor::start() noexcept
-{
-	threadState.store(THREAD_STATE_RUNNING, std::memory_order_release);
-}
+void TaskReactor::start() noexcept { threadState.store(THREAD_STATE_RUNNING, std::memory_order_release); }
 
 bool TaskReactor::send(ReactorCallback&& callback, std::string description, std::string origin)
 {
@@ -55,24 +49,30 @@ bool TaskReactor::send(ReactorCallback&& callback, std::string description, std:
 		return false;
 	}
 
-	const auto now = std::chrono::steady_clock::now();
 	Task task{
-	    .fireAt = now,
+	    .fireAt = {},
 	    .deadline = distantFuture(),
-	    .sequence = nextSequence.fetch_add(1, std::memory_order_relaxed),
+	    .sequence = 0,
 	    .description = std::move(description),
 	    .origin = std::move(origin),
 	    .function = std::move(callback),
 	};
 
+	bool crossedSoftLimit = false;
+	size_t pendingInbox = 0;
 	{
 		std::scoped_lock lock(mutex);
-		if (maxInboxSize > 0 && sendInbox.size() >= maxInboxSize) {
-			g_performanceMetrics.recordTaskDropped();
-			LOG_WARN("[TaskReactor] sendInbox overflow ({}), dropping task", sendInbox.size());
-			return false;
-		}
+		task.fireAt = std::chrono::steady_clock::now();
+		task.sequence = nextSequence.fetch_add(1, std::memory_order_relaxed);
 		sendInbox.push_back(std::move(task));
+		pendingInbox = sendInbox.size() + scheduleInbox.size() + cancelInbox.size();
+		if (maxInboxSize > 0 && pendingInbox >= maxInboxSize && !inboxAboveSoftLimit) {
+			inboxAboveSoftLimit = true;
+			crossedSoftLimit = true;
+		}
+	}
+	if (crossedSoftLimit) {
+		LOG_WARN("[TaskReactor] inbound backlog reached soft limit ({} tasks); preserving critical work", pendingInbox);
 	}
 
 	conditionVariable.notify_one();
@@ -88,22 +88,40 @@ bool TaskReactor::send(std::chrono::milliseconds expirationTime, ReactorCallback
 
 	const auto now = std::chrono::steady_clock::now();
 	Task task{
-	    .fireAt = now,
+	    .fireAt = {},
 	    .deadline = now + expirationTime,
-	    .sequence = nextSequence.fetch_add(1, std::memory_order_relaxed),
+	    .sequence = 0,
 	    .description = std::move(description),
 	    .origin = std::move(origin),
 	    .function = std::move(callback),
 	};
 
+	bool crossedLimit = false;
+	bool rejected = false;
+	size_t pendingTasks = 0;
 	{
 		std::scoped_lock lock(mutex);
-		if (maxInboxSize > 0 && sendInbox.size() >= maxInboxSize) {
-			g_performanceMetrics.recordTaskDropped();
-			LOG_WARN("[TaskReactor] sendInbox overflow ({}), dropping timed task", sendInbox.size());
-			return false;
+		pendingTasks = pendingTaskCountUnsafe();
+		if (maxInboxSize > 0 && pendingTasks >= maxInboxSize) {
+			rejected = true;
+		} else {
+			task.fireAt = std::chrono::steady_clock::now();
+			task.sequence = nextSequence.fetch_add(1, std::memory_order_relaxed);
+			sendInbox.push_back(std::move(task));
+			++pendingTasks;
 		}
-		sendInbox.push_back(std::move(task));
+		if (maxInboxSize > 0 && pendingTasks >= maxInboxSize && !inboxAboveSoftLimit) {
+			inboxAboveSoftLimit = true;
+			crossedLimit = true;
+		}
+	}
+	if (rejected) {
+		g_performanceMetrics.recordTaskDropped();
+		if (crossedLimit) {
+			LOG_WARN("[TaskReactor] backlog reached {} tasks; rejecting expiring work while preserving critical work",
+			         pendingTasks);
+		}
+		return false;
 	}
 
 	conditionVariable.notify_one();
@@ -129,40 +147,49 @@ uint32_t TaskReactor::schedule(std::chrono::milliseconds delay, ReactorCallback&
 
 	uint32_t identifier = 0;
 	Task task{
-	    .fireAt = std::chrono::steady_clock::now() + delay,
+	    .fireAt = {},
 	    .deadline = distantFuture(),
-	    .sequence = nextSequence.fetch_add(1, std::memory_order_relaxed),
+	    .sequence = 0,
 	    .description = std::move(description),
 	    .origin = std::move(origin),
 	    .function = std::move(callback),
 	};
 
+	bool crossedSoftLimit = false;
+	size_t pendingInbox = 0;
 	{
 		std::scoped_lock lock(mutex);
-		if (maxInboxSize > 0 && scheduleInbox.size() >= maxInboxSize) {
-			g_performanceMetrics.recordTaskDropped();
-			LOG_WARN("[TaskReactor] scheduleInbox overflow ({}), dropping scheduled task", scheduleInbox.size());
-			return 0;
-		}
 		if (activeIdentifiers.size() >= (std::numeric_limits<uint32_t>::max)()) {
 			g_performanceMetrics.recordTaskDropped();
 			LOG_WARN("[TaskReactor] task identifier space exhausted, dropping scheduled task");
 			return 0;
 		}
 
-		// A wrapped counter must skip ids still owned by pending tasks. Reserve
-		// the id before publishing the task, including while it is in the inbox.
+		// Reserve before publishing, including while bounded ingestion leaves the
+		// task in scheduleInbox. A wrapped counter must skip every live owner.
 		do {
 			identifier = ++nextIdentifier;
 		} while (identifier == 0 || activeIdentifiers.contains(identifier));
 		activeIdentifiers.insert(identifier);
 		task.identifier = identifier;
 		try {
+			task.fireAt = std::chrono::steady_clock::now() + delay;
+			task.sequence = nextSequence.fetch_add(1, std::memory_order_relaxed);
 			scheduleInbox.push_back(std::move(task));
+			std::push_heap(scheduleInbox.begin(), scheduleInbox.end(), taskComesAfter);
 		} catch (...) {
 			activeIdentifiers.erase(identifier);
 			throw;
 		}
+		pendingInbox = sendInbox.size() + scheduleInbox.size() + cancelInbox.size();
+		if (maxInboxSize > 0 && pendingInbox >= maxInboxSize && !inboxAboveSoftLimit) {
+			inboxAboveSoftLimit = true;
+			crossedSoftLimit = true;
+		}
+	}
+	if (crossedSoftLimit) {
+		LOG_WARN("[TaskReactor] inbound backlog reached soft limit ({} tasks); preserving scheduled work",
+		         pendingInbox);
 	}
 
 	conditionVariable.notify_one();
@@ -180,16 +207,27 @@ void TaskReactor::cancel(uint32_t taskIdentifier)
 		return;
 	}
 
+	bool crossedSoftLimit = false;
+	size_t pendingInbox = 0;
 	{
 		std::scoped_lock lock(mutex);
-		if (!activeIdentifiers.contains(taskIdentifier)) {
+		if (!activeIdentifiers.contains(taskIdentifier) || !cancellationRequests.insert(taskIdentifier).second) {
 			return;
 		}
-		if (maxInboxSize > 0 && cancelInbox.size() >= maxInboxSize) {
-			LOG_WARN("[TaskReactor] cancelInbox overflow ({}), dropping cancellation", cancelInbox.size());
-			return;
+		try {
+			cancelInbox.insert(taskIdentifier);
+		} catch (...) {
+			cancellationRequests.erase(taskIdentifier);
+			throw;
 		}
-		cancelInbox.push_back(taskIdentifier);
+		pendingInbox = sendInbox.size() + scheduleInbox.size() + cancelInbox.size();
+		if (maxInboxSize > 0 && pendingInbox >= maxInboxSize && !inboxAboveSoftLimit) {
+			inboxAboveSoftLimit = true;
+			crossedSoftLimit = true;
+		}
+	}
+	if (crossedSoftLimit) {
+		LOG_WARN("[TaskReactor] inbound backlog reached soft limit ({} tasks); preserving cancellation", pendingInbox);
 	}
 
 	conditionVariable.notify_one();
@@ -228,12 +266,13 @@ void TaskReactor::runOnce()
 #endif
 
 	PerformanceScope cycleScope(PerformanceMetric::ReactorCycle);
-	std::vector<Task> readyTasks;
-	readyTasks.reserve(128);
+	const auto cycleStart = std::chrono::steady_clock::now();
+	readyTasksBuffer.clear();
+	auto& readyTasks = readyTasksBuffer;
 
 	{
 		PerformanceScope scope(PerformanceMetric::ReactorDrainInbox);
-		drainInbox(readyTasks);
+		drainInbox();
 	}
 	{
 		PerformanceScope scope(PerformanceMetric::ReactorDrainReady);
@@ -241,11 +280,12 @@ void TaskReactor::runOnce()
 	}
 	{
 		PerformanceScope scope(PerformanceMetric::ReactorCallbacks);
-		executeReadyTasks(readyTasks);
+		executeReadyTasks(readyTasks, cycleStart);
 	}
 	{
 		std::scoped_lock lock(mutex);
-		g_performanceMetrics.recordQueueSize(sendInbox.size() + scheduleInbox.size() + cancelInbox.size() + taskHeap.size());
+		g_performanceMetrics.recordQueueSize(sendInbox.size() + scheduleInbox.size() + cancelInbox.size() +
+		                                     taskHeapSize.load(std::memory_order_relaxed));
 	}
 	g_performanceMetrics.maybeReport();
 }
@@ -268,32 +308,49 @@ void TaskReactor::drain()
 	while (std::chrono::steady_clock::now() < deadline) {
 		{
 			std::scoped_lock lock(mutex);
-			if (sendInbox.empty() && scheduleInbox.empty() && taskHeap.empty() && cancelInbox.empty()) {
+			if (sendInbox.empty() && scheduleInbox.empty() && cancelInbox.empty() &&
+			    taskHeapSize.load(std::memory_order_relaxed) == 0) {
 				return;
 			}
 		}
 		runOnce();
 		std::this_thread::yield();
 	}
-	LOG_WARN("[TaskReactor] drain timed out after {} ms",
-	         REACTOR_DRAIN_TIMEOUT.count());
+	LOG_WARN("[TaskReactor] drain timed out after {} ms", REACTOR_DRAIN_TIMEOUT.count());
 }
 
 bool TaskReactor::hasPendingTasks() const
 {
 	std::scoped_lock lock(mutex);
-	return !sendInbox.empty() || !scheduleInbox.empty() || !taskHeap.empty() || !cancelInbox.empty();
+	return !sendInbox.empty() || !scheduleInbox.empty() || !cancelInbox.empty() ||
+	       taskHeapSize.load(std::memory_order_relaxed) != 0;
 }
 
-bool TaskReactor::isReactorThread() const noexcept
+bool TaskReactor::canAcceptExpiringTask() const
 {
-	return currentReactor == this;
+	if (threadState.load(std::memory_order_acquire) != THREAD_STATE_RUNNING) {
+		return false;
+	}
+
+	std::scoped_lock lock(mutex);
+	return maxInboxSize == 0 || pendingTaskCountUnsafe() < maxInboxSize;
 }
 
-ThreadState TaskReactor::getState() const noexcept
+size_t TaskReactor::getPendingTaskCount() const
 {
-	return threadState.load(std::memory_order_acquire);
+	std::scoped_lock lock(mutex);
+	return pendingTaskCountUnsafe();
 }
+
+size_t TaskReactor::pendingTaskCountUnsafe() const noexcept
+{
+	return sendInbox.size() + scheduleInbox.size() + cancelInbox.size() + inboxTasksInFlight +
+	       taskHeapSize.load(std::memory_order_relaxed);
+}
+
+bool TaskReactor::isReactorThread() const noexcept { return currentReactor == this; }
+
+ThreadState TaskReactor::getState() const noexcept { return threadState.load(std::memory_order_acquire); }
 
 bool TaskReactor::taskComesAfter(const Task& lhs, const Task& rhs) noexcept
 {
@@ -303,59 +360,124 @@ bool TaskReactor::taskComesAfter(const Task& lhs, const Task& rhs) noexcept
 	return lhs.sequence > rhs.sequence;
 }
 
-void TaskReactor::drainInbox(std::vector<Task>& readyTasks)
+void TaskReactor::drainInbox()
 {
-	std::vector<Task> sentTasks;
-	std::vector<Task> scheduledTasks;
-	std::vector<uint32_t> cancellations;
+	auto& sentTasks = sentTasksBuffer;
+	auto& scheduledTasks = scheduledTasksBuffer;
+	auto& cancellations = cancellationsBuffer;
 
 	{
 		std::scoped_lock lock(mutex);
-		sentTasks.swap(sendInbox);
-		scheduledTasks.swap(scheduleInbox);
-		cancellations.swap(cancelInbox);
+		const size_t drainLimit =
+		    maxInboxDrainPerCycle > 0 ? maxInboxDrainPerCycle : std::numeric_limits<size_t>::max();
+		sentTasks.reserve(std::min(drainLimit, sendInbox.size()));
+		scheduledTasks.reserve(std::min(drainLimit, scheduleInbox.size()));
+		cancellations.reserve(cancelInbox.size());
+
+		size_t drained = 0;
+		while (drained < drainLimit && (!sendInbox.empty() || !scheduleInbox.empty())) {
+			if (sendInbox.empty() ||
+			    (!scheduleInbox.empty() && taskComesAfter(sendInbox.front(), scheduleInbox.front()))) {
+				std::pop_heap(scheduleInbox.begin(), scheduleInbox.end(), taskComesAfter);
+				scheduledTasks.push_back(std::move(scheduleInbox.back()));
+				scheduleInbox.pop_back();
+			} else {
+				sentTasks.push_back(std::move(sendInbox.front()));
+				sendInbox.pop_front();
+			}
+			++drained;
+		}
+		// Cancellation is control traffic: drain it every cycle so a large task
+		// burst cannot cause a stopped event to run before its cancellation.
+		for (uint32_t identifier : cancelInbox) cancellations.push_back(identifier);
+		cancelInbox.clear();
+		inboxTasksInFlight = sentTasks.size() + scheduledTasks.size() + cancellations.size();
+
+		undrainedTaskFrontier.reset();
+		if (!sendInbox.empty() || !scheduleInbox.empty()) {
+			const auto& next = sendInbox.empty() || (!scheduleInbox.empty() &&
+			                                         taskComesAfter(sendInbox.front(), scheduleInbox.front()))
+			                       ? scheduleInbox.front()
+			                       : sendInbox.front();
+			undrainedTaskFrontier.emplace(next.fireAt, next.sequence);
+		}
+
+		const size_t pendingTasks = pendingTaskCountUnsafe();
+		if (maxInboxSize == 0 || pendingTasks < std::max<size_t>(1, maxInboxSize / 2)) {
+			inboxAboveSoftLimit = false;
+		}
+	}
+
+	const size_t previousHeapSize = taskHeap.size();
+	const size_t incomingTasks = sentTasks.size() + scheduledTasks.size();
+	if (incomingTasks > 0) {
+		const size_t requiredCapacity = previousHeapSize + incomingTasks;
+		if (requiredCapacity > taskHeap.capacity()) {
+			// Reserve for the whole batch with geometric spare capacity, so
+			// small later batches retain amortized vector growth.
+			const size_t capacity = taskHeap.capacity();
+			const size_t growth = std::min(capacity / 2, taskHeap.max_size() - capacity);
+			taskHeap.reserve(std::max(requiredCapacity, capacity + growth));
+		}
 	}
 
 	for (auto& task : scheduledTasks) {
 		taskHeap.push_back(std::move(task));
-		std::push_heap(taskHeap.begin(), taskHeap.end(), taskComesAfter);
+	}
+	for (auto& task : sentTasks) {
+		taskHeap.push_back(std::move(task));
+	}
+
+	// A burst is heapified once in linear time. With only a few arrivals and a
+	// large future-event heap, incremental insertion avoids rebuilding it all.
+	if (incomingTasks > 0) {
+		if (reactor_detail::shouldRebuildHeap(previousHeapSize, incomingTasks)) {
+			std::make_heap(taskHeap.begin(), taskHeap.end(), taskComesAfter);
+		} else {
+			for (size_t heapSize = previousHeapSize + 1; heapSize <= taskHeap.size(); ++heapSize) {
+				std::push_heap(taskHeap.begin(), taskHeap.begin() + heapSize, taskComesAfter);
+			}
+		}
 	}
 
 	for (uint32_t identifier : cancellations) {
-		// cancel() only queues live ids, and retirement removes queued entries
-		// before releasing the reservation for reuse after a counter wrap.
+		// cancel() only queues live ids; retirement consumes queued cancellation
+		// before releasing their reservation. This also covers undrained tasks.
 		cancelled.insert(identifier);
 	}
-
-	const auto now = std::chrono::steady_clock::now();
-	for (auto& task : sentTasks) {
-		// Scheduled tasks deferred by the fairness or time-budget limit come back
-		// through sendInbox, so this path must honour cancellations too — otherwise
-		// stopEvent() silently does nothing for any task that got deferred and the
-		// callback runs after the caller retired it. Plain send() tasks carry
-		// identifier 0 and are never cancellable.
-		if (task.identifier != 0 && cancelled.contains(task.identifier)) {
-			retireIdentifier(task.identifier);
-			continue;
-		}
-
-		if (!task.hasExpired(now)) {
-			readyTasks.push_back(std::move(task));
-		} else {
-			retireIdentifier(task.identifier);
-			g_performanceMetrics.recordTaskExpired();
-		}
+	{
+		// Publication and removal of the in-flight count are one producer-visible
+		// operation: admission must never observe neither representation.
+		std::scoped_lock lock(mutex);
+		taskHeapSize.store(taskHeap.size(), std::memory_order_relaxed);
+		inboxTasksInFlight = 0;
 	}
+
+	// Retain only storage, never task captures. An exceptional unbounded control
+	// burst must not leave arbitrarily large scratch buffers resident forever.
+	cancellations.clear();
+	scheduledTasks.clear();
+	sentTasks.clear();
+	if (cancellations.capacity() > REACTOR_MAX_RETAINED_SCRATCH) std::vector<uint32_t>{}.swap(cancellations);
+	if (scheduledTasks.capacity() > REACTOR_MAX_RETAINED_SCRATCH) std::vector<Task>{}.swap(scheduledTasks);
+	if (sentTasks.capacity() > REACTOR_MAX_RETAINED_SCRATCH) std::vector<Task>{}.swap(sentTasks);
 }
 
 void TaskReactor::drainReadyTasks(std::vector<Task>& readyTasks)
 {
 	const auto now = std::chrono::steady_clock::now();
 
-	while (!taskHeap.empty() && taskHeap.front().fireAt <= now) {
+	const size_t readyLimit = maxTasksPerCycle > 0 ? maxTasksPerCycle : std::numeric_limits<size_t>::max();
+	size_t processed = 0;
+	while (processed < readyLimit && !taskHeap.empty() && taskHeap.front().fireAt <= now) {
+		if (undrainedTaskFrontier &&
+		    *undrainedTaskFrontier < std::pair{taskHeap.front().fireAt, taskHeap.front().sequence}) {
+			break;
+		}
 		std::pop_heap(taskHeap.begin(), taskHeap.end(), taskComesAfter);
 		auto readyTask = std::move(taskHeap.back());
 		taskHeap.pop_back();
+		++processed; // Retired due entries consume the cycle limit too.
 
 		if (cancelled.contains(readyTask.identifier) || readyTask.hasExpired(now)) {
 			retireIdentifier(readyTask.identifier);
@@ -369,6 +491,7 @@ void TaskReactor::drainReadyTasks(std::vector<Task>& readyTasks)
 		// remains valid and a wrapped counter cannot assign it to another task.
 		readyTasks.push_back(std::move(readyTask));
 	}
+	taskHeapSize.store(taskHeap.size(), std::memory_order_relaxed);
 }
 
 bool TaskReactor::consumeCancellation(uint32_t identifier)
@@ -378,10 +501,11 @@ bool TaskReactor::consumeCancellation(uint32_t identifier)
 	}
 
 	std::scoped_lock lock(mutex);
-	const bool cancelledInBatch = std::erase(cancelInbox, identifier) > 0;
+	const bool cancelledInBatch = cancelInbox.erase(identifier) > 0;
 	const bool cancelledPreviously = cancelled.erase(identifier) > 0;
 	const bool wasCancelled = cancelledInBatch || cancelledPreviously;
 	if (wasCancelled) {
+		cancellationRequests.erase(identifier);
 		activeIdentifiers.erase(identifier);
 	}
 	return wasCancelled;
@@ -393,28 +517,18 @@ bool TaskReactor::retireIdentifier(uint32_t identifier)
 		return false;
 	}
 
-	// Consume cancellations that arrived after execution was committed before
+	// Consume cancellations received after execution was committed before
 	// releasing the reservation, so they cannot target a reused identifier.
 	std::scoped_lock lock(mutex);
-	const bool cancelledInBatch = std::erase(cancelInbox, identifier) > 0;
+	const bool cancelledInBatch = cancelInbox.erase(identifier) > 0;
 	const bool cancelledPreviously = cancelled.erase(identifier) > 0;
+	cancellationRequests.erase(identifier);
 	activeIdentifiers.erase(identifier);
 	return cancelledInBatch || cancelledPreviously;
 }
 
-void TaskReactor::executeReadyTasks(std::vector<Task>& readyTasks)
+void TaskReactor::executeReadyTasks(std::vector<Task>& readyTasks, std::chrono::steady_clock::time_point cycleStart)
 {
-	{
-		PerformanceScope scope(PerformanceMetric::ReactorSort);
-		std::sort(readyTasks.begin(), readyTasks.end(), [](const Task& lhs, const Task& rhs) {
-			if (lhs.fireAt != rhs.fireAt) {
-				return lhs.fireAt < rhs.fireAt;
-			}
-			return lhs.sequence < rhs.sequence;
-		});
-	}
-
-	const auto cycleStart = std::chrono::steady_clock::now();
 	uint32_t tasksExecuted = 0;
 	std::chrono::steady_clock::duration slowestDuration{};
 	std::optional<size_t> slowestTaskIndex;
@@ -427,18 +541,12 @@ void TaskReactor::executeReadyTasks(std::vector<Task>& readyTasks)
 			continue;
 		}
 
-		if (maxTasksPerCycle > 0 && tasksExecuted >= maxTasksPerCycle) {
-			LOG_WARN("[TaskReactor] fairness limit reached ({} tasks/cycle), deferring {} tasks; next: {}",
-			         maxTasksPerCycle, readyTasks.size() - tasksExecuted, taskLabel(task.description, task.origin));
-			break;
-		}
-
 		// Past every deferral point, so this task is committed to running now.
 		// Honour cancellations that landed while it waited, but keep its identifier
 		// reserved until the callback returns so a wrapped counter cannot reuse it.
-		// tasksExecuted doubles as the index of the first unprocessed task in the
-		// deferral loop below, so a skipped task still has to advance it.
+		// tasksExecuted is also the index of the first task in the deferral loop.
 		if (consumeCancellation(task.identifier)) {
+			task.function = {};
 			++tasksExecuted;
 			continue;
 		}
@@ -447,9 +555,10 @@ void TaskReactor::executeReadyTasks(std::vector<Task>& readyTasks)
 		try {
 			if (g_performanceMetrics.isEnabled()) {
 				const auto callbackStart = std::chrono::steady_clock::now();
-				const auto queueLatency = callbackStart > task.fireAt ? callbackStart - task.fireAt : std::chrono::steady_clock::duration::zero();
+				const auto queueLatency = callbackStart > task.fireAt ? callbackStart - task.fireAt
+				                                                      : std::chrono::steady_clock::duration::zero();
 				g_performanceMetrics.record(PerformanceMetric::ReactorQueueLatency,
-					std::chrono::duration_cast<std::chrono::nanoseconds>(queueLatency).count());
+				                            std::chrono::duration_cast<std::chrono::nanoseconds>(queueLatency).count());
 			}
 			PerformanceScope callbackScope(PerformanceMetric::ReactorCallback);
 			task.function();
@@ -460,6 +569,10 @@ void TaskReactor::executeReadyTasks(std::vector<Task>& readyTasks)
 			LOG_ERROR("[TaskReactor] Unhandled non-standard task exception in {}",
 			          taskLabel(task.description, task.origin));
 		}
+		// Reusing readyTasksBuffer must not extend the lifetime of captures until
+		// the next cycle. Network backlog tickets and shared ownership are expected
+		// to be released as soon as the callback finishes.
+		task.function = {};
 
 		const auto taskEnd = std::chrono::steady_clock::now();
 		retireIdentifier(task.identifier);
@@ -468,7 +581,7 @@ void TaskReactor::executeReadyTasks(std::vector<Task>& readyTasks)
 		if (g_performanceMetrics.isEnabled()) {
 			const auto taskNanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(taskDuration).count();
 			g_performanceMetrics.recordReactorCallbackSource(
-				taskNanoseconds > 0 ? static_cast<uint64_t>(taskNanoseconds) : 0, task.description, task.origin);
+			    taskNanoseconds > 0 ? static_cast<uint64_t>(taskNanoseconds) : 0, task.description, task.origin);
 		}
 		if (taskDuration > slowestDuration) {
 			slowestDuration = taskDuration;
@@ -485,8 +598,9 @@ void TaskReactor::executeReadyTasks(std::vector<Task>& readyTasks)
 				    "time budget exceeded (budget={} ms, cycle={:.3f} ms, executed={}), "
 				    "deferring {} tasks; slowest: {} ({:.3f} ms); last: {} ({:.3f} ms)",
 				    timeBudget.count(), cycleMicros / 1000.0, tasksExecuted, readyTasks.size() - tasksExecuted,
-				    slowestTaskIndex ? taskLabel(readyTasks[*slowestTaskIndex].description,
-				                                readyTasks[*slowestTaskIndex].origin) : "unknown",
+				    slowestTaskIndex
+				        ? taskLabel(readyTasks[*slowestTaskIndex].description, readyTasks[*slowestTaskIndex].origin)
+				        : "unknown",
 				    slowestMicros / 1000.0, taskLabel(task.description, task.origin),
 				    std::chrono::duration_cast<std::chrono::microseconds>(taskDuration).count() / 1000.0);
 			}
@@ -496,10 +610,11 @@ void TaskReactor::executeReadyTasks(std::vector<Task>& readyTasks)
 
 	if (tasksExecuted < readyTasks.size()) {
 		g_performanceMetrics.recordTaskDeferred(readyTasks.size() - tasksExecuted);
-		std::scoped_lock lock(mutex);
 		for (size_t i = tasksExecuted; i < readyTasks.size(); ++i) {
-			sendInbox.push_back(std::move(readyTasks[i]));
+			taskHeap.push_back(std::move(readyTasks[i]));
+			std::push_heap(taskHeap.begin(), taskHeap.end(), taskComesAfter);
 		}
+		taskHeapSize.store(taskHeap.size(), std::memory_order_relaxed);
 	}
 }
 
@@ -525,8 +640,8 @@ void TaskReactor::waitForWork()
 
 #ifdef STATS_ENABLED
 	if (g_stats.isEnabled() && g_stats.isRunning()) {
-		const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
-		    std::chrono::steady_clock::now() - waitStart).count();
+		const auto elapsed =
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count();
 		g_stats.addDispatcherWaitTime(0, elapsed > 0 ? static_cast<uint64_t>(elapsed) : 0);
 	}
 #endif

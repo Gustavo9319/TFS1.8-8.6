@@ -9,8 +9,11 @@
 #include "thread_pool.h"
 
 #include <source_location>
+#include <string_view>
 
 using TaskFunc = ReactorCallback;
+
+bool shouldCaptureTaskMetadata() noexcept;
 
 inline constexpr int DISPATCHER_TASK_EXPIRATION = 2000;
 inline constexpr uint64_t SLOW_TASK_THRESHOLD_NS = 50'000'000; // 50ms in nanoseconds
@@ -20,14 +23,16 @@ const auto SYSTEM_TIME_ZERO = std::chrono::steady_clock::time_point(std::chrono:
 class Task
 {
 public:
-	explicit Task(TaskFunc&& f, const std::string& description, const std::string& extraDescription);
-	Task(uint32_t ms, TaskFunc&& f, const std::string& description, const std::string& extraDescription);
+	explicit Task(TaskFunc&& f, std::string_view description, std::string_view extraDescription);
+	Task(uint32_t ms, TaskFunc&& f, std::string_view description, std::string_view extraDescription);
 	virtual ~Task() = default;
 
 	void operator()() { func(); }
 
 	void setDontExpire() { expiration = SYSTEM_TIME_ZERO; }
 	[[nodiscard]] bool hasExpired() const;
+	[[nodiscard]] bool hasExpiration() const noexcept { return expiration != SYSTEM_TIME_ZERO; }
+	[[nodiscard]] std::chrono::steady_clock::time_point getExpiration() const noexcept { return expiration; }
 
 	const std::string description;
 	const std::string extraDescription;
@@ -42,8 +47,10 @@ private:
 	TaskFunc func;
 };
 
-std::unique_ptr<Task> createTaskWithStats(TaskFunc&& f, const std::string& description, const std::string& extraDescription);
-std::unique_ptr<Task> createTaskWithStats(uint32_t expiration, TaskFunc&& f, const std::string& description, const std::string& extraDescription);
+std::unique_ptr<Task> createTaskWithStats(TaskFunc&& f, std::string_view description,
+                                          std::string_view extraDescription);
+std::unique_ptr<Task> createTaskWithStats(uint32_t expiration, TaskFunc&& f, std::string_view description,
+                                          std::string_view extraDescription);
 
 class Dispatcher
 {
@@ -55,18 +62,10 @@ public:
 	void join() noexcept {}
 	void shutdown() noexcept;
 
-	void addTask(std::unique_ptr<Task>&& task);
-	void addTask(TaskFunc&& f, const std::source_location location = std::source_location::current())
-	{
-		addTask(createTaskWithStats(std::move(f), location.function_name(),
-		                            std::string(location.file_name()) + ":" + std::to_string(location.line())));
-	}
-	void addTask(uint32_t expiration, TaskFunc&& f,
-	             const std::source_location location = std::source_location::current())
-	{
-		addTask(createTaskWithStats(expiration, std::move(f), location.function_name(),
-		                            std::string(location.file_name()) + ":" + std::to_string(location.line())));
-	}
+	bool addTask(std::unique_ptr<Task>&& task);
+	bool addTask(TaskFunc&& f, const std::source_location location = std::source_location::current());
+	bool addTask(uint32_t expiration, TaskFunc&& f,
+	             const std::source_location location = std::source_location::current());
 	void executeTask(std::unique_ptr<Task> task);
 
 	template <typename Func, typename Callback>
