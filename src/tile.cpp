@@ -517,7 +517,7 @@ void Tile::synchronizeAutoCarpet()
 		const auto* houseTile = tile ? tile->getHouseTile() : nullptr;
 		return houseTile && houseTile->getHouse() == house;
 	};
-	const auto visible = [instanceId](const Item* item) {
+	const auto visible = [](const Item* item) {
 		return item->getInstanceID() == 0 || item->getInstanceID() == instanceId;
 	};
 	const auto deployed = [](const Item* item) {
